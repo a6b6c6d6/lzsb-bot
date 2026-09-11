@@ -63,7 +63,7 @@
       }
     ],
     "temperature": 0.8,
-    "max_tokens": 800,
+    "max_tokens": 2400,
     "timeout": 180,
     "max_retry": 2
   },

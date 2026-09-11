@@ -782,7 +782,7 @@ def plan_queries(cfg, topic, max_queries=2):
     head = "\n".join((p.get("content") or "")[:400] for p in ops[:3])
     user = "【标题】%s\n【楼主发言节选】\n%s" % (title, head[:1000])
 
-    out, err = call_llm(cfg, PLAN_SYSTEM, user)
+    out, err = call_llm(cfg, PLAN_SYSTEM, user, strict_tail=False)
     if err or not out:
         return [web_search_fallback_query(topic)]
     qs = []
@@ -799,7 +799,7 @@ def web_search_fallback_query(topic):
     return web_search.build_query(topic)
 
 
-def _chat_once(cfg, provider, system_prompt, user_prompt, opener):
+def _chat_once(cfg, provider, system_prompt, user_prompt, opener, strict_tail=True):
     """对单个 provider(接口+模型)发起一次请求;成功返回文本,失败抛异常。"""
     llm = cfg.get("llm") or {}
     base = (provider.get("base_url") or "").rstrip("/")
@@ -834,15 +834,24 @@ def _chat_once(cfg, provider, system_prompt, user_prompt, opener):
     if resp.headers.get("Content-Encoding") == "gzip":
         raw = gzip.decompress(raw)
     j = json.loads(raw.decode("utf-8", "replace"))
-    text = (j.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    choice = (j.get("choices") or [{}])[0]
+    text = choice.get("message", {}).get("content", "") or ""
     text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text,
                   flags=re.S | re.I).strip()
     if not text:
         raise ValueError("模型返回空内容")
+
+    # 截断检测:finish_reason=length 说明 token 用尽,句子会被切断在半句上
+    if choice.get("finish_reason") == "length":
+        log("  ⚠ 输出被 max_tokens 截断!请调大 config.json 的 llm.max_tokens", "WARN")
+    elif strict_tail and not text.rstrip().endswith(
+            ("。", "！", "？", "!", ".", "…", "~", "”", '"')):
+        # 只在生成回帖时检查句尾 —— 提炼关键词那种任务输出本来就不带句号
+        log("  ⚠ 回复结尾疑似不完整:%s" % text[-24:], "WARN")
     return text
 
 
-def call_llm(cfg, system_prompt, user_prompt):
+def call_llm(cfg, system_prompt, user_prompt, strict_tail=True):
     """依次尝试 llm.providers 里的每个接口;
 
     前一个限速 / 5xx / 返回空内容时自动切到下一个,全部失败才报错。
@@ -871,7 +880,8 @@ def call_llm(cfg, system_prompt, user_prompt):
         name = p.get("name") or p.get("model")
         for attempt in range(1, retry + 1):
             try:
-                return _chat_once(cfg, p, system_prompt, user_prompt, opener), None
+                return _chat_once(cfg, p, system_prompt, user_prompt, opener,
+                                  strict_tail=strict_tail), None
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
