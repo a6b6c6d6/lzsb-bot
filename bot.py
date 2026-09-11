@@ -217,6 +217,35 @@ def strip_tags(s):
     return re.sub(r"<[^>]+>", "", s).strip()
 
 
+def extract_div_inner(html, pos):
+    """从 pos(指向某个 <div 的起始)开始,按标签配对返回该 div 的内部 HTML。
+
+    正文 div 内部有嵌套(如 <div class=post-readability-content>),非贪婪正则会被
+    第一个 </div> 提前截断,所以必须做括号配对。
+    """
+    if pos < 0:
+        return ""
+    i = html.find(">", pos)
+    if i < 0:
+        return ""
+    i += 1
+    depth = 1
+    while depth > 0 and i < len(html):
+        no = html.find("<div", i)
+        nc = html.find("</div>", i)
+        if nc < 0:
+            return html[i:]
+        if 0 <= no < nc:
+            depth += 1
+            i = no + 4
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[i:nc]
+            i = nc + 6
+    return html[i:]
+
+
 def extract_csrf(html):
     m = re.search(r'name="_csrf"\s+value="([0-9a-fA-F]+)"', html)
     return m.group(1) if m else None
@@ -336,50 +365,77 @@ class LsbSite:
     # ---- 帖子内容 ---------------------------------------------------------
 
     def fetch_topic(self, tid):
-        """抓取帖子页,返回结构化信息。"""
+        """抓取帖子页,返回结构化信息。选择器基于 2026-09-11 实测 DOM。"""
         url = "%s/topic/%d" % (self.base, tid)
-        code, html, final = self.http.get(url)
+        code, html, _ = self.http.get(url)
         if code != 200:
             return None
 
         info = {
             "tid": tid, "url": url, "html": html,
             "title": "", "forum_id": None, "forum_name": "",
-            "author": "", "content": "", "floor_count": 0,
-            "can_reply": False, "closed": False,
+            "author": "", "content": "", "reply_count": 0,
+            "post_count": 0, "can_reply": False, "closed": False,
+            "is_gacha": False, "gacha_status": "",
         }
 
-        m = re.search(r"<title>(.*?)</title>", html, re.S)
+        # 标题:<h1 class="post-content-title"><a>标题</a></h1>
+        m = re.search(r'<h1[^>]*class="post-content-title"[^>]*>(.*?)</h1>', html, re.S)
         if m:
-            info["title"] = html_unescape(strip_tags(m.group(1))).split(" - ")[0].strip()
+            info["title"] = html_unescape(strip_tags(m.group(1))).strip()
+        if not info["title"]:
+            m = re.search(r"<title>(.*?)</title>", html, re.S)
+            if m:
+                info["title"] = html_unescape(strip_tags(m.group(1))).split(" - ")[0].strip()
 
-        m = re.search(r'href="/forum/(\d+)"[^>]*>\s*<span[^>]*>([^<]+)</span>', html)
+        # 板块:取面包屑里最后一个 /forum/N
+        m = re.search(r'<div class="breadcrumb">(.*?)</div>', html, re.S)
         if m:
-            info["forum_id"] = int(m.group(1))
-            info["forum_name"] = html_unescape(m.group(2)).strip()
-        else:
-            m = re.search(r'---\s*([^<]*?)共?(\d*)\s*回复', html)
+            links = re.findall(r'href="/forum/(\d+)"[^>]*>([^<]+)</a>', m.group(1))
+            if links:
+                info["forum_id"] = int(links[-1][0])
+                info["forum_name"] = html_unescape(links[-1][1]).strip()
 
-        # 首楼正文
-        m = re.search(r'<div class="post-content"[^>]*>(.*?)</div>\s*(?:<div class="post-actions|</li>)',
-                      html, re.S)
-        if not m:
-            m = re.search(r'<div class="post-content"[^>]*>(.*?)</div>', html, re.S)
+        # 发卡贴标记(站点自带的虚拟卡帖标志,比关键词可靠)
+        m = re.search(r'class="virtual-card-title-status[^"]*"[^>]*>(.*?)</span>', html, re.S)
         if m:
-            seg = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", m.group(1), flags=re.S)
-            info["content"] = strip_tags(seg)[:6000]
+            info["is_gacha"] = True
+            info["gacha_status"] = html_unescape(strip_tags(m.group(1))).strip()
 
-        m = re.search(r'class="post-title post-author"[^>]*>\s*<a[^>]*>([^<]+)</a>', html)
+        # 浏览量 / 回复数
+        m = re.search(r'<div class="post-content-stats">(.*?)</div>', html, re.S)
         if m:
-            info["author"] = html_unescape(m.group(1)).strip()
+            nums = re.findall(r">(\d+)<", m.group(1))
+            if len(nums) >= 2:
+                info["reply_count"] = int(nums[1])
 
-        info["floor_count"] = len(re.findall(r'data-floor="(\d+)"', html))
+        # 楼层数
+        info["post_count"] = len(re.findall(r'<li class="post-item post-entry"', html))
 
-        # 是否可回复:有 reply-login-box 说明未登录;有 locked 标记说明已关闭
+        # 楼主
+        m = re.search(r'<a[^>]*class="post-title post-author"[^>]*>(.*?)</a>', html, re.S)
+        if m:
+            info["author"] = html_unescape(strip_tags(m.group(1))).strip()
+
+        # 首楼正文:post-content 内层是 post-readability-content / nb-editor-post-content
+        pos = html.find("nb-editor-post-content")
+        if pos == -1:
+            pos = html.find('class="post-content"')
+        if pos != -1:
+            start = html.rfind("<div", 0, pos)
+            seg = extract_div_inner(html, start)
+            seg = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", seg, flags=re.S)
+            seg = re.sub(r"<br\s*/?>", "\n", seg, flags=re.I)
+            seg = re.sub(r"</(p|div|li)>", "\n", seg, flags=re.I)
+            info["content"] = html_unescape(strip_tags(seg))[:6000].strip()
+            # 记录正文图片:纯图帖(只有截图没有文字)正文会抓成空串,需要单独识别
+            info["images"] = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', seg)
+                              if "avatar" not in u and "emoji" not in u]
+
         info["can_reply"] = ("reply-login-box" not in html)
         info["closed"] = ("data-topic-closed" in html or
                           "topic-management-locked" in html or
-                          "已关闭" in html or "锁定" in html)
+                          "topic-locked" in html)
         return info
 
     # ---- 发帖表单 ---------------------------------------------------------
@@ -593,7 +649,11 @@ def should_reply(cfg, topic, store):
     if topic.get("closed"):
         return False, "帖子已关闭/锁定"
     if not (topic.get("content") or "").strip():
+        if topic.get("images"):
+            return False, "纯图片帖(正文只有截图,没有文字可依)"
         return False, "抓不到正文"
+    if cfg.get("skip_gacha", True) and topic.get("is_gacha"):
+        return False, "发卡/虚拟卡帖(%s)" % (topic.get("gacha_status") or "无状态")
 
     fid = topic.get("forum_id")
     deny_forums = cfg.get("deny_forums") or []
@@ -607,11 +667,6 @@ def should_reply(cfg, topic, store):
     for kw in (cfg.get("deny_keywords") or []):
         if kw and kw in title:
             return False, "标题命中屏蔽词「%s」(发卡/推广类)" % kw
-
-    topic_age_limit = cfg.get("max_topic_age_minutes")
-    if topic_age_limit:
-        row = store.lastmod_of(tid)
-        # lastmod 是 UTC 秒级时间戳文本,粗略判断即可
 
     return True, "可以回复"
 
@@ -634,6 +689,13 @@ class Bot:
     def stop(self, *_):
         self.running = False
         log("收到停止信号,正在退出……", "WARN")
+
+    def sleep(self, seconds):
+        """可被 Ctrl+C 提前打断的睡眠。"""
+        for _ in range(int(seconds)):
+            if not self.running:
+                return
+            time.sleep(1)
 
     def bootstrap(self):
         """首次运行:把存量帖子标记为已读,避免一上线就爆量回复。"""
@@ -671,17 +733,11 @@ class Bot:
                 log("已达今日回复上限 %d,本轮跳过余下新帖" % limit, "WARN")
                 return
 
-            code, html, _ = self.site.http.get("%s/topic/%d" % (self.site.base, tid))
-            if code != 200:
-                log("抓取帖子 %d 失败 code=%s" % (tid, code), "WARN")
-                self.store.mark_seen(tid, lm)
-                continue
-
             topic = self.site.fetch_topic(tid)
             if not topic:
+                log("抓取帖子 %d 失败(可能被删或代理抖动)" % tid, "WARN")
                 self.store.mark_seen(tid, lm)
                 continue
-            topic["html"] = html
 
             self.store.mark_seen(tid, lm, topic.get("title", ""))
 
@@ -731,25 +787,37 @@ class Bot:
         log("  屏蔽板块  : %s" % (cfg.get("deny_forums") or []))
         log("=" * 60)
 
-        if not self.site.login():
-            log("登录失败,进程退出。请检查 config.json 的账号密码与代理设置", "ERROR")
-            return 2
-
-        if self.first_run:
-            self.bootstrap()
-
+        # 代理掉线是常态(Clash 换节点、机场抖动),所以登录失败不退出进程,
+        # 而是按退避策略重试;代理恢复后能自愈,无需人工重启。
+        fail = 0
+        bootstrapped = False
         while self.running:
+            if not self.site.check_login():
+                if not self.site.login():
+                    fail += 1
+                    if self.once:
+                        log("登录失败,--once 模式直接退出", "ERROR")
+                        return 2
+                    wait = min(300, 30 * fail)
+                    log("登录失败(连续第 %d 次)。常见原因:Clash 代理未开启 / 节点掉线 / "
+                        "账号密码有误。%d 秒后重试。" % (fail, wait), "WARN")
+                    self.sleep(wait)
+                    continue
+            fail = 0
+
+            if not bootstrapped:
+                if self.first_run:
+                    self.bootstrap()
+                bootstrapped = True
+
             try:
                 self.tick()
             except Exception as e:
                 log("本轮异常: %s: %s" % (type(e).__name__, e), "ERROR")
+
             if self.once:
                 break
-            interval = self.cfg.get("poll_interval", 60)
-            for _ in range(interval):
-                if not self.running:
-                    break
-                time.sleep(1)
+            self.sleep(self.cfg.get("poll_interval", 60))
 
         log("机器人已停止")
         return 0
