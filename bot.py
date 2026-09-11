@@ -179,6 +179,11 @@ class Store:
             (tid, lastmod, datetime.now().isoformat(timespec="seconds"), title))
         self.db.commit()
 
+    def unmark_seen(self, tid):
+        """撤销「已见」标记,让该帖在下一轮重新进入候选(用于失败重试)。"""
+        self.db.execute("DELETE FROM seen WHERE tid=?", (tid,))
+        self.db.commit()
+
     def all_seen_ids(self):
         """一次取回全部已见 tid,避免逐条 SELECT(首次 bootstrap 要查上万次)。"""
         return {r[0] for r in self.db.execute("SELECT tid FROM seen")}
@@ -204,7 +209,9 @@ class Store:
         return row[0] if row else None
 
     def has_replied(self, tid):
-        return self.db.execute("SELECT 1 FROM replied WHERE tid=?", (tid,)).fetchone() is not None
+        """只认成功的记录 —— 失败的要留着重试,否则一次网络抖动就永久放弃这帖。"""
+        row = self.db.execute("SELECT result FROM replied WHERE tid=?", (tid,)).fetchone()
+        return bool(row) and str(row[0]).startswith("ok")
 
     def save_reply(self, tid, title, text, result):
         self.db.execute(
@@ -615,7 +622,7 @@ class LsbSite:
             out["captcha"] = captcha
         return out
 
-    def submit_reply(self, tid, text):
+    def _submit_reply_once(self, tid, text):
         """完整发帖流程:实时解析表单 -> 过验证 -> POST。返回 (ok, message)。"""
         url = "%s/topic/%d" % (self.base, tid)
         code, html, _ = self.http.get(url)
@@ -671,6 +678,24 @@ class LsbSite:
         if j.get("ok"):
             return True, j.get("message") or j.get("tip") or "发布成功"
         return False, j.get("message") or j.get("tip") or str(j)[:200]
+
+    # 判定为「网络层瞬时故障」的错误特征:这类才值得重试;
+    # 业务层拒绝(内容不能为空、权限不足等)重试多少次都一样。
+    _RETRYABLE = ("请求失败", "打开发帖页失败", "返回非 JSON")
+
+    def submit_reply(self, tid, text, max_attempt=3):
+        """带重试的发帖。代理抖动在这环境里很常见,一次失败就放弃太浪费。"""
+        msg = ""
+        for attempt in range(1, max(1, max_attempt) + 1):
+            ok, msg = self._submit_reply_once(tid, text)
+            if ok:
+                return True, msg
+            if not any(k in (msg or "") for k in self._RETRYABLE):
+                return False, msg            # 业务层拒绝,不重试
+            if attempt < max_attempt:
+                log("  提交失败(%s),%d 秒后重试" % (msg or "网络错误", 2 * attempt), "WARN")
+                time.sleep(2 * attempt)
+        return False, msg
 
 
 # ----------------------------------------------------------------------------
@@ -896,6 +921,7 @@ class Bot:
         self.store = Store()
         self.site = LsbSite(cfg)
         self.running = True
+        self.fail_count = {}          # tid -> 已失败次数(仅内存,重启清零)
         self.system_prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
         self.first_run = not self.store.db.execute("SELECT 1 FROM seen LIMIT 1").fetchone()
 
@@ -1052,8 +1078,18 @@ class Bot:
                 self.store.incr_today()
                 log("  已发布 #%d: %s" % (tid, msg))
             else:
-                self.store.save_reply(tid, topic.get("title", ""), text, "fail: " + msg)
-                log("  发布失败 #%d: %s" % (tid, msg), "ERROR")
+                retryable = any(k in (msg or "") for k in LsbSite._RETRYABLE)
+                n = self.fail_count.get(tid, 0) + 1
+                self.fail_count[tid] = n
+                # 网络类失败(代理抖动)值得重试:撤销「已见」标记,下一轮重新处理;
+                # 但最多重试 3 次,免得某个帖一直失败就无限占用额度。
+                if retryable and n <= 3:
+                    self.store.unmark_seen(tid)
+                    log("  发布失败 #%d: %s —— 下轮重试(第 %d/3 次)" % (tid, msg, n), "WARN")
+                else:
+                    self.store.save_reply(tid, topic.get("title", ""), text,
+                                          "fail: " + msg)
+                    log("  发布失败 #%d: %s(不再重试)" % (tid, msg), "ERROR")
 
     def run(self):
         cfg = self.cfg
