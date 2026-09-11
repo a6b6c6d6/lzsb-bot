@@ -246,6 +246,38 @@ def extract_div_inner(html, pos):
     return html[i:]
 
 
+def parse_posts(html):
+    """解析帖子页里的全部楼层,返回 [{pid, author, content}, ...]。
+
+    楼层容器是 <li class="post-item post-entry" id="post-{pid}">;
+    HTML 里没有 data-floor,楼层顺序即文档顺序。
+    """
+    marks = [m.start() for m in re.finditer(r'<li[^>]*class="post-item post-entry"', html)]
+    if not marks:
+        return []
+    marks.append(len(html))
+    out = []
+    for i in range(len(marks) - 1):
+        seg = html[marks[i]:marks[i + 1]]
+        pid = re.search(r'id="post-(\d+)"', seg)
+        au = re.search(r'<a[^>]*class="post-title post-author"[^>]*>(.*?)</a>', seg, re.S)
+        text = ""
+        pos = seg.find("nb-editor-post-content")
+        if pos >= 0:
+            start = seg.rfind("<div", 0, pos)
+            body = extract_div_inner(seg, start)
+            body = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", body, flags=re.S)
+            body = re.sub(r"<br\s*/?>", "\n", body, flags=re.I)
+            body = re.sub(r"</(p|div|li|blockquote)>", "\n", body, flags=re.I)
+            text = html_unescape(strip_tags(body)).strip()
+        out.append({
+            "pid": pid.group(1) if pid else "",
+            "author": html_unescape(strip_tags(au.group(1))).strip() if au else "",
+            "content": text,
+        })
+    return out
+
+
 def extract_csrf(html):
     m = re.search(r'name="_csrf"\s+value="([0-9a-fA-F]+)"', html)
     return m.group(1) if m else None
@@ -399,6 +431,7 @@ class LsbSite:
             "author": "", "content": "", "reply_count": 0,
             "post_count": 0, "can_reply": False, "closed": False,
             "is_gacha": False, "gacha_status": "",
+            "posts": [], "op_name": "", "op_posts": [],
         }
 
         # 标题:<h1 class="post-content-title"><a>标题</a></h1>
@@ -453,6 +486,13 @@ class LsbSite:
             # 记录正文图片:纯图帖(只有截图没有文字)正文会抓成空串,需要单独识别
             info["images"] = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', seg)
                               if "avatar" not in u and "emoji" not in u]
+
+        # 解析全部楼层:生成回复时用「楼主在本帖的全部发言」做上下文,
+        # 比只看首楼更能抓住楼主的完整诉求(追问、补充都在后面的楼层里)。
+        info["posts"] = parse_posts(html)
+        info["op_name"] = (info["posts"][0].get("author") if info["posts"] else "") or info["author"]
+        info["op_posts"] = [p for p in info["posts"]
+                            if p.get("author") and p["author"] == info["op_name"]]
 
         info["can_reply"] = ("reply-login-box" not in html)
         info["closed"] = ("data-topic-closed" in html or
@@ -583,31 +623,44 @@ DEFAULT_SYSTEM_PROMPT = """你是一个专业的论坛回帖助手,在技术论�
 请严格输出回帖正文,不要任何解释、前缀或后缀。"""
 
 
-def build_user_prompt(topic):
-    parts = ["【帖子标题】%s" % topic["title"]]
+def build_user_prompt(topic, scope="op", max_chars=6000):
+    """构造用户提示词。
+
+    scope='op'    —— 用「楼主在本帖的全部发言」做上下文(默认)
+    scope='first' —— 只用首楼正文
+    """
+    parts = ["【帖子标题】%s" % (topic.get("title") or "")]
     if topic.get("forum_name"):
         parts.append("【所属板块】%s" % topic["forum_name"])
-    if topic.get("author"):
-        parts.append("【楼主】%s" % topic["author"])
-    body = (topic.get("content") or "").strip()
-    if len(body) > 4000:
-        body = body[:4000] + "\n……(内容过长已截断)"
-    parts.append("【帖子正文】\n%s" % body)
-    parts.append("\n请写一条符合上述要求的中文回帖。")
-    return "\n".join(parts)
+    op = topic.get("op_name") or topic.get("author") or ""
+    if op:
+        parts.append("【楼主】%s" % op)
+
+    if scope == "op" and topic.get("op_posts"):
+        lines = []
+        for i, p in enumerate(topic["op_posts"], 1):
+            c = (p.get("content") or "").strip() or "(本层无文字,可能是图片)"
+            lines.append("#%d %s" % (i, c))
+        parts.append("【楼主在本帖的全部发言(共 %d 条,按时间顺序)】\n%s"
+                     % (len(topic["op_posts"]), "\n".join(lines)))
+    else:
+        parts.append("【帖子正文】\n%s" % ((topic.get("content") or "").strip()))
+
+    prompt = "\n".join(parts)
+    if len(prompt) > max_chars:
+        prompt = prompt[:max_chars] + "\n……(内容过长,已截断)"
+    return prompt + "\n\n请针对楼主的帖子,写一条符合上述要求的中文回帖。"
 
 
-def call_llm(cfg, system_prompt, user_prompt):
+def _chat_once(cfg, provider, system_prompt, user_prompt, opener):
+    """对单个 provider(接口+模型)发起一次请求;成功返回文本,失败抛异常。"""
     llm = cfg.get("llm") or {}
-    base = (llm.get("base_url") or "").rstrip("/")
-    key = llm.get("api_key") or ""
-    model = llm.get("model") or ""
+    base = (provider.get("base_url") or "").rstrip("/")
+    key = provider.get("api_key") or ""
+    model = provider.get("model") or ""
     if not (base and key and model):
-        return None, "config.json 的 llm 配置不完整(base_url / api_key / model)"
-
-    url = base
-    if not url.endswith("/chat/completions"):
-        url = url + "/chat/completions"
+        raise ValueError("provider 配置不完整(base_url/api_key/model)")
+    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
 
     payload = {
         "model": model,
@@ -618,43 +671,74 @@ def call_llm(cfg, system_prompt, user_prompt):
         "temperature": llm.get("temperature", 0.8),
         "max_tokens": llm.get("max_tokens", 800),
     }
-    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST", headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+            # 不少中转站前面挂了 Cloudflare;不设 UA 会发 Python-urllib/x.y,
+            # 被 Error 1010(browser signature)直接拦掉
+            "User-Agent": cfg.get("user_agent") or DEFAULT_UA,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "close",
+        })
+    resp = opener.open(req, timeout=llm.get("timeout", 180))
+    raw = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip":
+        raw = gzip.decompress(raw)
+    j = json.loads(raw.decode("utf-8", "replace"))
+    text = (j.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text,
+                  flags=re.S | re.I).strip()
+    if not text:
+        raise ValueError("模型返回空内容")
+    return text
 
-    req = urllib.request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + key,
-        "Accept": "application/json",
-    })
-    handlers = []
+
+def call_llm(cfg, system_prompt, user_prompt):
+    """依次尝试 llm.providers 里的每个接口;
+
+    前一个限速 / 5xx / 返回空内容时自动切到下一个,全部失败才报错。
+    """
+    llm = cfg.get("llm") or {}
+    providers = [dict(p) for p in (llm.get("providers") or [])]
+
+    # 向后兼容:只写了单个 base_url/api_key/model 的旧配置
+    if not providers and llm.get("base_url"):
+        providers = [{"name": "default", "base_url": llm.get("base_url"),
+                      "api_key": llm.get("api_key"), "model": llm.get("model")}]
+
+    providers = [p for p in providers
+                 if p.get("base_url") and p.get("api_key") and p.get("model")]
+    if not providers:
+        return None, "config.json 的 llm 配置不完整(providers / base_url+api_key+model 均为空)"
+
     proxy = cfg.get("llm_proxy") or cfg.get("proxy") or ""
-    if proxy:
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    else:
-        handlers.append(urllib.request.ProxyHandler({}))
+    handlers = [urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {})]
     opener = urllib.request.build_opener(*handlers)
 
-    for attempt in range(1, (llm.get("max_retry", 2) or 2) + 1):
-        try:
-            resp = opener.open(req, timeout=llm.get("timeout", 180))
-            raw = resp.read()
-            if resp.headers.get("Content-Encoding") == "gzip":
-                raw = gzip.decompress(raw)
-            j = json.loads(raw.decode("utf-8", "replace"))
-            text = (j.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text,
-                          flags=re.S | re.I).strip()
-            if not text:
-                return None, "模型返回空内容"
-            return text, None
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
-            if attempt >= (llm.get("max_retry", 2) or 2):
-                return None, "LLM HTTP %s: %s" % (e.code, detail)
-        except Exception as e:
-            if attempt >= (llm.get("max_retry", 2) or 2):
-                return None, "LLM 调用失败: %s: %s" % (type(e).__name__, e)
-        time.sleep(2 * attempt)
-    return None, "LLM 调用失败"
+    retry = max(1, int(llm.get("max_retry", 2) or 1))
+    errs = []
+    for p in providers:
+        name = p.get("name") or p.get("model")
+        for attempt in range(1, retry + 1):
+            try:
+                return _chat_once(cfg, p, system_prompt, user_prompt, opener), None
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:160].replace("\n", " ")
+                except Exception:
+                    pass
+                errs.append("%s HTTP%s %s" % (name, e.code, detail))
+            except Exception as e:
+                errs.append("%s %s: %s" % (name, type(e).__name__, str(e)[:80]))
+            if attempt < retry:
+                time.sleep(1.5 * attempt)
+        log("  AI 接口「%s」不可用,自动切换到下一个" % name, "WARN")
+
+    return None, "所有 AI 接口均失败 -> " + " | ".join(errs[-4:])
 
 
 # ----------------------------------------------------------------------------
@@ -768,9 +852,12 @@ class Bot:
                 log("  跳过 #%d 「%s」 — %s" % (tid, topic.get("title", "")[:40], reason))
                 continue
 
-            log("  生成回复: #%d 「%s」(%s)" % (tid, topic.get("title", "")[:40],
-                                             topic.get("forum_name") or "?"))
-            text, err = call_llm(self.cfg, self.system_prompt, build_user_prompt(topic))
+            log("  生成回复: #%d 「%s」(%s) 楼主发言 %d 条"
+                % (tid, topic.get("title", "")[:40],
+                   topic.get("forum_name") or "?", len(topic.get("op_posts") or [])))
+            text, err = call_llm(self.cfg, self.system_prompt,
+                                 build_user_prompt(topic,
+                                                   self.cfg.get("context_scope", "op")))
             if err:
                 log("  LLM 失败: %s" % err, "ERROR")
                 continue

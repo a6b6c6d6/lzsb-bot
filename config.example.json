@@ -35,10 +35,22 @@
   "_dry_run说明": "true = 只生成不提交,用来观察输出质量;确认满意后再改成 false",
   "dry_run": true,
 
+  "_llm说明": "providers 按顺序尝试,前一个限速/5xx/返回空内容时自动切下一个;可放多个中转站互为备份",
   "llm": {
-    "base_url": "",
-    "api_key": "",
-    "model": "",
+    "providers": [
+      {
+        "name": "主接口",
+        "base_url": "https://你的中转站/v1",
+        "api_key": "sk-xxxxxx",
+        "model": "deepseek-v4-flash"
+      },
+      {
+        "name": "备用接口",
+        "base_url": "https://备用中转站/v1",
+        "api_key": "sk-yyyyyy",
+        "model": "ministral-3"
+      }
+    ],
     "temperature": 0.8,
     "max_tokens": 800,
     "timeout": 180,
