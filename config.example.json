@@ -32,6 +32,17 @@
 
   "system_prompt": "",
 
+  "_context_scope说明": "op = 用『楼主在本帖的全部发言』作上下文(默认);first = 只用首楼正文",
+  "context_scope": "op",
+
+  "_搜索说明": "回复前先联网搜一下,把结果作为背景资料喂给 AI,让回帖有帖子之外的信息量",
+  "enable_search": true,
+  "search_topk": 5,
+  "search_timeout": 12,
+  "search_sources": ["google_news", "bing", "hn"],
+  "_search_proxy说明": "留空 = 用上面的 proxy;搜索引擎基本都需要代理才能访问",
+  "search_proxy": "",
+
   "_dry_run说明": "true = 只生成不提交,用来观察输出质量;确认满意后再改成 false",
   "dry_run": true,
 
