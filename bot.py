@@ -451,6 +451,37 @@ class LsbSite:
             out[int(m.group(1))] = m.group(2) or ""
         return out
 
+    def fetch_forum_topics(self, forum_id, pages=1):
+        """抓板块列表页,返回该板块第 1 页(起)的帖子 id 列表。
+
+        为什么不用 sitemap 做实时检测:sitemap 有明显滞后 ——
+        实测首页已有 21484,而 sitemap 最大只到 21474,新帖根本没进去。
+        板块列表页是实时渲染的,所以改用它。
+
+        页面里除主列表外还有侧边栏的"每日热帖"等干扰链接,因此把范围限定在
+        <ul class="post-list"> ... </ul> 之内。
+        """
+        tids = []
+        for p in range(1, max(1, pages) + 1):
+            url = "%s/forum/%d" % (self.base, forum_id)
+            if p > 1:
+                url += "?p=%d" % p
+            code, html, _ = self.http.get(url)
+            if code != 200:
+                continue
+            m = re.search(r'<ul[^>]*class="post-list"[^>]*>', html)
+            if not m:
+                continue
+            seg = html[m.end():]
+            end = seg.find("</ul>")
+            if end > 0:
+                seg = seg[:end]
+            for mm in re.finditer(r'href="/topic/(\d+)"', seg):
+                tid = int(mm.group(1))
+                if tid not in tids:
+                    tids.append(tid)
+        return tids
+
     # ---- 帖子内容 ---------------------------------------------------------
 
     def fetch_topic(self, tid):
@@ -897,43 +928,52 @@ class Bot:
         return True
 
     def tick(self):
-        sm = self.site.fetch_sitemap()
-        if not sm:
-            return
-        fresh = []
-        for tid, lm in sm.items():
-            if not self.store.is_seen(tid):
-                fresh.append((tid, lm))
+        # 【检测】从各板块列表页收集候选帖。
+        # 不用 sitemap:sitemap 有明显滞后(实测首页已到 21484,它最大只到 21474),
+        # 靠它会漏掉新帖。板块列表页是实时渲染的,才是可靠来源。
+        forums = self.cfg.get("scan_forums") or [1, 3, 4, 5, 6, 9, 10]
+        deny = set(self.cfg.get("deny_forums") or [])
+        pages = int(self.cfg.get("scan_pages", 1) or 1)
 
+        candidates, seen_now = [], set()
+        for fid in forums:
+            if fid in deny:
+                continue
+            for tid in self.site.fetch_forum_topics(fid, pages):
+                if tid not in seen_now:
+                    seen_now.add(tid)
+                    candidates.append(tid)
+
+        if not candidates:
+            log("本轮没抓到任何候选帖(板块页拉取失败?检查代理是否可用)", "WARN")
+            return
+
+        fresh = [t for t in candidates if not self.store.is_seen(t)]
         if not fresh:
             return
 
-        # 【安全阀 1】一轮发现的新帖异常多 → 判定为首次运行或长期停摆
+        # 【安全阀 1】候选里"没见过"的数量异常多 → 首次运行或长期停摆
         # (例如代理挂了几天、bootstrap 被中断)。此时绝不能逐个回复,
-        # 否则等于把全站老帖挨个挖一遍坟。只标记为已见。
-        threshold = int(self.cfg.get("bootstrap_threshold", 30) or 30)
+        # 否则等于把近期帖子挨个挖坟。只标记为已见。
+        threshold = int(self.cfg.get("bootstrap_threshold", 12) or 12)
         if len(fresh) > threshold:
             log("本轮发现 %d 个未见过帖子(超过阈值 %d),判定为首次运行或长期停摆:"
                 "只标记为已见、不回复" % (len(fresh), threshold), "WARN")
             now = datetime.now().isoformat(timespec="seconds")
-            self.store.mark_seen_many([(t, l, now, "") for t, l in fresh])
+            self.store.mark_seen_many([(t, "", now, "") for t in fresh])
             return
 
-        # 【安全阀 2】时效过滤:只回最近有更新的帖子,避免翻出历史帖
-        max_age = int(self.cfg.get("max_topic_age_minutes", 0) or 0)
-        if max_age > 0:
-            keep = [(t, l) for t, l in fresh if is_fresh(l, max_age)]
-            if len(keep) != len(fresh):
-                log("本轮 %d 个新帖中,有 %d 个超过 %d 分钟未更新,已跳过"
-                    % (len(fresh), len(fresh) - len(keep), max_age))
-            fresh = keep
-            if not fresh:
-                return
+        # 【安全阀 2】单轮最多处理 N 个,避免突发爆量
+        max_per_tick = int(self.cfg.get("max_per_tick", 5) or 5)
+        pending = sorted(fresh)[:max_per_tick]
+        if len(fresh) > max_per_tick:
+            log("本轮 %d 个新帖,按单轮上限先处理 %d 个,其余下轮继续"
+                % (len(fresh), max_per_tick))
 
-        log("发现 %d 个新帖: %s" % (len(fresh), ", ".join(str(t) for t, _ in fresh)))
+        log("发现 %d 个新帖: %s" % (len(pending), ", ".join(str(t) for t in pending)))
 
         limit = self.cfg.get("daily_limit", 20)
-        for tid, lm in sorted(fresh):          # 先处理旧一点的,顺序更自然
+        for tid in pending:
             if not self.running:
                 return
             if not self.dry and self.store.today_count() >= limit:
@@ -943,10 +983,10 @@ class Bot:
             topic = self.site.fetch_topic(tid)
             if not topic:
                 log("抓取帖子 %d 失败(可能被删或代理抖动)" % tid, "WARN")
-                self.store.mark_seen(tid, lm)
+                self.store.mark_seen(tid, "")
                 continue
 
-            self.store.mark_seen(tid, lm, topic.get("title", ""))
+            self.store.mark_seen(tid, "", topic.get("title", ""))
 
             ok, reason = should_reply(self.cfg, topic, self.store)
             if not ok:
