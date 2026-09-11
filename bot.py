@@ -113,26 +113,41 @@ class HttpClient:
             body = urllib.parse.urlencode(data, doseq=True).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        try:
-            resp = self.opener.open(req, timeout=self.timeout)
-            raw = resp.read()
-            if resp.headers.get("Content-Encoding") == "gzip":
-                try:
-                    raw = gzip.decompress(raw)
-                except OSError:
-                    pass
-            return resp.getcode(), raw.decode("utf-8", "replace"), resp.geturl()
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            if e.headers.get("Content-Encoding") == "gzip":
-                try:
-                    raw = gzip.decompress(raw)
-                except OSError:
-                    pass
-            return e.code, raw.decode("utf-8", "replace"), url
-        except Exception as e:
-            return 0, "", "%s: %s" % (type(e).__name__, e)
+        # 代理抖动在这个环境里是常态(频繁 code=0),网络层失败要自动重试,
+        # 否则一次闪断就会漏掉一个帖子。
+        retry = 3
+        last_err = ""
+        for attempt in range(retry + 1):
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            try:
+                resp = self.opener.open(req, timeout=self.timeout)
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        raw = gzip.decompress(raw)
+                    except OSError:
+                        pass
+                return resp.getcode(), raw.decode("utf-8", "replace"), resp.geturl()
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                if e.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        raw = gzip.decompress(raw)
+                    except OSError:
+                        pass
+                text = raw.decode("utf-8", "replace")
+                if e.code >= 500 and attempt < retry:      # 5xx 才值得重试
+                    last_err = "HTTP %s" % e.code
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return e.code, text, url
+            except Exception as e:
+                last_err = "%s: %s" % (type(e).__name__, e)
+                if attempt < retry:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        return 0, "", last_err
 
     def get(self, url, **kw):
         return self.request("GET", url, **kw)
@@ -1008,8 +1023,8 @@ class Bot:
 
             topic = self.site.fetch_topic(tid)
             if not topic:
-                log("抓取帖子 %d 失败(可能被删或代理抖动)" % tid, "WARN")
-                self.store.mark_seen(tid, "")
+                # 不标记为已见:多半是代理抖动,下轮还要再试
+                log("抓取帖子 %d 失败(代理抖动?),下轮重试" % tid, "WARN")
                 continue
 
             self.store.mark_seen(tid, "", topic.get("title", ""))
