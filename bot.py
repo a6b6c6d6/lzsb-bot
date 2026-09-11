@@ -322,10 +322,26 @@ class LsbSite:
             log("登录页没找到 _csrf", "ERROR")
             return False
 
-        code, body, _ = self.http.post(
-            self.base + "/login",
-            {"_csrf": csrf, "username": user, "password": pwd},
-            referer=self.base + "/login")
+        # 人机验证:登录表单挂了自托管 Cap(challenge -> PoW -> instrumentation -> redeem)
+        cap_token = ""
+        m = re.search(r'data-cap-api-endpoint="([^"]+)"', html)
+        if m:
+            try:
+                import cap_solver
+                log("检测到 Cap 人机验证,开始求解(约 10-20 秒)……")
+                t0 = time.time()
+                cap_token = cap_solver.get_cap_token(
+                    self.http, m.group(1), referer=self.base + "/login") or ""
+                log("Cap 验证通过,耗时 %.1fs" % (time.time() - t0))
+            except Exception as e:
+                log("Cap 求解失败: %s" % e, "ERROR")
+                return False
+
+        data = {"_csrf": csrf, "username": user, "password": pwd}
+        if cap_token:
+            data["cap_token"] = cap_token
+        code, body, final = self.http.post(self.base + "/login", data,
+                                           referer=self.base + "/login")
         if code not in (200, 302):
             log("登录请求异常: code=%s" % code, "ERROR")
             return False
@@ -334,7 +350,13 @@ class LsbSite:
             log("登录成功(账号 %s)" % user)
             return True
 
-        # 登录页返回可能是 JSON,尝试读取提示
+        # 账号级「登录邮箱验证」:服务端要求先过 6 位邮箱验证码
+        if "user_review_login_email" in (final or "") or "登录邮箱验证" in body:
+            log("被「登录邮箱验证」拦截:该账号登录需要邮箱验证码。", "WARN")
+            log("处理方式:在浏览器手动登录一次完成验证,然后把 bbs_auth 写进 "
+                "config.json 的 cookie 字段(该 Cookie 有效期很长)", "WARN")
+            return False
+
         tip = ""
         try:
             j = json.loads(body)
