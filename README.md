@@ -35,6 +35,11 @@
 | `allow_forums` | 若填写,则只回复这些板块(优先于 deny) |
 | `deny_keywords` | 标题命中即跳过,用于滤掉发卡 / 赠送 / 兑换类推广帖 |
 | `system_prompt` | 留空则使用内置提示词 |
+| `context_scope` | `op` = 用楼主全部发言做上下文(默认);`first` = 只用首楼 |
+| `enable_search` | 是否联网搜索,给 AI 补充帖子之外的背景 |
+| `search_sources` | 搜索来源:`google_news` / `bing` / `hn` / `github` |
+| `llm.providers` | 多个 AI 接口,按顺序尝试,限速或报错自动切换 |
+| `skip_gacha` | 是否跳过站点标记的发卡贴,默认 `true` |
 | `dry_run` | `true` = 只生成不提交 |
 
 板块编号:1 错误地方 / 2 福利放送 / 3 资源分享 / 4 技术交流 / 5 求助问答 /
@@ -51,17 +56,16 @@ python bot.py --login-only 只验证登录能不能成功
 
 ## 五、工作原理
 
-1. **发现新帖** —— 拉 `sitemap.xml`(含全站帖子与 `lastmod`),与本地 `state.db`
-   比对,找出没见过的帖子 ID。
-2. **过滤** —— 板块黑名单、标题关键词、已回过、已锁帖,全部跳过。
-3. **抓正文** —— 解析帖子页标题、板块、楼主、首楼正文。
-4. **生成回复** —— 调 OpenAI 兼容接口(`/chat/completions`)。
-5. **过反自动化闸门** —— 发帖前实时从帖子页解析:
+1. **登录** —— 账号密码登录,自动求解 Cap 人机验证(见 `cap_solver.py`)。
+2. **发现新帖** —— 拉 `sitemap.xml`,与本地 `state.db` 比对,找出没见过的帖子 ID。
+3. **过滤** —— 板块黑名单、站点自带的发卡贴标记、标题关键词、已回过、已锁帖,全部跳过。
+4. **抓内容** —— 解析标题、板块、楼主,以及 **楼主在本帖的全部发言**(不只首楼)。
+5. **联网搜索** —— 先用 AI 提炼 1~2 个关键词,再多源并行搜索,结果作为背景资料喂给模型。
+6. **生成回复** —— 调 OpenAI 兼容接口;多个接口可配成 `providers` 互为备份,前一个失败自动切换。
+7. **过反自动化闸门** —— 发帖前实时从帖子页解析 `_csrf`、验证码挑战与 PoW 参数:
    - `_csrf`:页面级随机值,每次请求都不同
-   - PoW:`SHA256(prefix + ":" + hex(i))` 需以 N 个 `0` 开头,暴力求解
-   - 算术验证码:解析题面求值
-   - 蜜罐字段 `native_captcha_company`:必须留空
-6. **提交** —— `POST` 表单 `action`,`X-Requested-With: XMLHttpRequest`,解析 JSON 结果。
+   - PoW(标准 SHA-256 前缀匹配)/ 算术题 / 蜜罐字段 `native_captcha_company` 留空
+8. **提交** —— `POST /reply_edit`,`X-Requested-With: XMLHttpRequest`,解析 JSON 结果。
 
 ## 六、文件说明
 
