@@ -1,0 +1,14 @@
+# 含账号密码与 API Key,绝对不能提交
+config.json
+
+# 运行状态与日志
+state.db
+state.db-journal
+bot.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

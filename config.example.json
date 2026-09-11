@@ -1,0 +1,47 @@
+{
+  "_说明": "复制本文件为 config.json 后填写。config.json 已在 .gitignore 中,不会进仓库。",
+
+  "base_url": "https://linux.sb",
+  "proxy": "http://127.0.0.1:7897",
+  "timeout": 30,
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0",
+
+  "username": "",
+  "password": "",
+  "_cookie说明": "可选。留空则用上面的账号密码自动登录并自动续期;若填了 Cookie 串则优先使用它。",
+  "cookie": "",
+
+  "poll_interval": 60,
+  "reply_delay_min": 30,
+  "reply_delay_max": 180,
+  "daily_limit": 20,
+
+  "_板块": "1 错误地方 / 2 福利放送 / 3 资源分享 / 4 技术交流 / 5 求助问答 / 6 社区治理 / 8 我要推广 / 9 社区公告 / 10 大禹治水",
+  "deny_forums": [2, 8],
+  "allow_forums": [],
+
+  "_屏蔽词说明": "标题命中任一关键词就跳过,用于滤掉发卡/赠送/兑换类推广帖",
+  "deny_keywords": [
+    "发卡", "发卡贴", "兑换", "卡密", "卡号", "抽奖", "盖楼", "领取",
+    "免费额度", "送额度", "测试额度", "体验额度", "已结束", "已蹬完", "速蹬",
+    "白嫖", "公益站", "中转站", "推广", "邀请码", "订阅", "试用"
+  ],
+
+  "system_prompt": "",
+
+  "_dry_run说明": "true = 只生成不提交,用来观察输出质量;确认满意后再改成 false",
+  "dry_run": true,
+
+  "llm": {
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "temperature": 0.8,
+    "max_tokens": 800,
+    "timeout": 180,
+    "max_retry": 2
+  },
+
+  "_llm_proxy说明": "留空表示与上面的 proxy 相同;若中转站需要不同出口可单独指定",
+  "llm_proxy": ""
+}
