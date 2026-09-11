@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import zlib
@@ -89,10 +90,16 @@ def solve_challenge(token, ch):
 # 2) instrumentation
 # ---------------------------------------------------------------------------
 
+# Node 可执行文件候选:Windows / Termux(Android) / 通用 Linux 都覆盖。
+# 顺序上先找确定存在的绝对路径,最后回退到 PATH 里的 node。
 NODE_CANDIDATES = [
     r'C:\Users\user\.mytools\binaries\node\versions\22.22.2-3\node.exe',
     r'C:\Users\user\.mytools\binaries\node\versions\24.19.0\node.exe',
     r'D:\mytools\NodeTools\node.exe',
+    '/data/data/com.termux/files/usr/bin/node',   # Termux(Android)
+    '/usr/bin/node',
+    '/usr/local/bin/node',
+    '/opt/homebrew/bin/node',
     'node',
 ]
 
@@ -125,7 +132,8 @@ _VARS_RE = re.compile(r'var \w+=\d+;var \w+=\d+;var \w+=\d+;var \w+=\d+;')
 def _find_node():
     for p in NODE_CANDIDATES:
         if p == 'node':
-            return p
+            # 交给系统解析 PATH(Termux / Linux 下 node 通常就在 PATH 里)
+            return shutil.which('node') or 'node'
         if os.path.exists(p):
             return p
     return None

@@ -82,3 +82,65 @@ python bot.py --login-only 只验证登录能不能成功
 - PoW 难度低(2~5 个前导零),求解通常在 1 秒内完成。
 - 若某帖发不出去,日志会记录服务端返回的原始提示,据此排查。
 - 建议先跑几天 `dry_run` 观察生成质量,再考虑开放真实发布。
+
+---
+
+## 八、在手机上运行(Android + Termux)
+
+iOS 基本不可行(不允许后台常驻进程,也装不了 Node),Android 可以。
+整套代码是纯标准库 + Node 执行 Cap 脚本,跨平台无障碍。
+
+### 1. 装环境
+
+从 **F-Droid** 安装 Termux(别用 Play 商店版,版本太旧),然后:
+
+```
+pkg update && pkg install python nodejs tmux
+```
+
+`nodejs` 是**必需**的 —— Cap 人机验证的 DOM 指纹计算要靠 Node 执行。
+
+### 2. 把项目拷到手机
+
+用 MT Manager 把整个 `lzsb-bot` 目录放进手机存储,然后在 Termux 里:
+
+```
+termux-setup-storage          # 授予存储权限(只需一次)
+cp -r /sdcard/lzsb-bot ~/
+cd ~/lzsb-bot
+sed -i 's/\r$//' start.sh bot.py cap_solver.py web_search.py
+```
+
+最后那行 `sed` 是**必须**的:Windows 的 CRLF 换行符会让 bash 报
+`\r: command not found`。
+
+### 3. 改配置
+
+编辑 `config.json`,把 `proxy` 改成手机 Clash 客户端的 HTTP 端口
+(通常是 `http://127.0.0.1:7890`,以你的客户端设置为准)。
+
+### 4. 运行
+
+```
+bash start.sh
+```
+
+脚本会自动申请 `termux-wake-lock`,避免熄屏后进程被系统冻结。
+
+### 5. 挂后台(推荐)
+
+```
+tmux new -s bot        # 新建会话
+bash start.sh          # 在里面运行
+# 按 Ctrl+B 再按 D  → detach,进程继续跑
+tmux attach -t bot     # 需要时再连回来
+```
+
+### 手机端的坑
+
+| 问题 | 说明 |
+|---|---|
+| 被杀后台 | 国产 ROM(小米/华为等)的省电策略会清理 Termux → 在系统设置里关掉电池优化、允许后台活动 |
+| 代理端口 | 确认 Clash 客户端的 HTTP 端口与 `config.json` 一致 |
+| 换行符 | 从 Windows 拷贝后必须执行上面的 `sed` |
+| 耗电 | 持续运行会比平时费电 |
