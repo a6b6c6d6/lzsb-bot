@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -155,6 +155,13 @@ class Store:
     def __init__(self, path=DB_PATH):
         new = not os.path.exists(path)
         self.db = sqlite3.connect(path, timeout=15)
+        # WAL + NORMAL:首次 bootstrap 要写上万条记录,默认的
+        # journal_mode=delete + synchronous=FULL 会把每条 commit 都落盘同步,慢到分钟级
+        try:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
         self.db.execute("""CREATE TABLE IF NOT EXISTS seen (
             tid INTEGER PRIMARY KEY, lastmod TEXT, first_seen TEXT, title TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS replied (
@@ -170,6 +177,19 @@ class Store:
         self.db.execute(
             "INSERT OR IGNORE INTO seen(tid,lastmod,first_seen,title) VALUES(?,?,?,?)",
             (tid, lastmod, datetime.now().isoformat(timespec="seconds"), title))
+        self.db.commit()
+
+    def all_seen_ids(self):
+        """一次取回全部已见 tid,避免逐条 SELECT(首次 bootstrap 要查上万次)。"""
+        return {r[0] for r in self.db.execute("SELECT tid FROM seen")}
+
+    def mark_seen_many(self, rows):
+        """批量写入 + 单事务,用于首次 bootstrap。"""
+        if not rows:
+            return
+        self.db.executemany(
+            "INSERT OR IGNORE INTO seen(tid,lastmod,first_seen,title) VALUES(?,?,?,?)",
+            rows)
         self.db.commit()
 
     def touch_seen(self, tid, lastmod):
@@ -244,6 +264,21 @@ def extract_div_inner(html, pos):
                 return html[i:nc]
             i = nc + 6
     return html[i:]
+
+
+def is_fresh(lastmod, max_age_minutes):
+    """sitemap 的 lastmod 是否为最近 max_age_minutes 内(UTC)。
+
+    解析不出来时返回 True —— 宁可放行也不要因为格式变化就全都不回。
+    """
+    if not lastmod:
+        return True
+    try:
+        dt = datetime.strptime(lastmod.strip(), "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, AttributeError):
+        return True
+    dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt) <= timedelta(minutes=max_age_minutes)
 
 
 def parse_posts(html):
@@ -845,18 +880,20 @@ class Bot:
             time.sleep(1)
 
     def bootstrap(self):
-        """首次运行:把存量帖子标记为已读,避免一上线就爆量回复。"""
+        """首次运行:把存量帖子标记为已读,避免一上线就爆量回复。
+
+        用「一次查全量 + 单事务批量写」,否则上万条逐条 commit 会卡好几分钟。
+        """
         sm = self.site.fetch_sitemap()
         if not sm:
             return False
         log("sitemap 共 %d 条帖子" % len(sm))
-        n = 0
-        for tid, lm in sm.items():
-            if not self.store.is_seen(tid):
-                self.store.mark_seen(tid, lm)
-                n += 1
-        if n:
-            log("首次运行:已将 %d 条存量帖子标记为已见(不会回复它们)" % n)
+        known = self.store.all_seen_ids()
+        now = datetime.now().isoformat(timespec="seconds")
+        rows = [(tid, lm, now, "") for tid, lm in sm.items() if tid not in known]
+        if rows:
+            self.store.mark_seen_many(rows)
+        log("已将 %d 条存量帖子标记为已见(不会回复它们)" % len(rows))
         return True
 
     def tick(self):
@@ -864,12 +901,35 @@ class Bot:
         if not sm:
             return
         fresh = []
-        for tid, lm in sorted(sm.items(), reverse=True):
+        for tid, lm in sm.items():
             if not self.store.is_seen(tid):
                 fresh.append((tid, lm))
 
         if not fresh:
             return
+
+        # 【安全阀 1】一轮发现的新帖异常多 → 判定为首次运行或长期停摆
+        # (例如代理挂了几天、bootstrap 被中断)。此时绝不能逐个回复,
+        # 否则等于把全站老帖挨个挖一遍坟。只标记为已见。
+        threshold = int(self.cfg.get("bootstrap_threshold", 30) or 30)
+        if len(fresh) > threshold:
+            log("本轮发现 %d 个未见过帖子(超过阈值 %d),判定为首次运行或长期停摆:"
+                "只标记为已见、不回复" % (len(fresh), threshold), "WARN")
+            now = datetime.now().isoformat(timespec="seconds")
+            self.store.mark_seen_many([(t, l, now, "") for t, l in fresh])
+            return
+
+        # 【安全阀 2】时效过滤:只回最近有更新的帖子,避免翻出历史帖
+        max_age = int(self.cfg.get("max_topic_age_minutes", 0) or 0)
+        if max_age > 0:
+            keep = [(t, l) for t, l in fresh if is_fresh(l, max_age)]
+            if len(keep) != len(fresh):
+                log("本轮 %d 个新帖中,有 %d 个超过 %d 分钟未更新,已跳过"
+                    % (len(fresh), len(fresh) - len(keep), max_age))
+            fresh = keep
+            if not fresh:
+                return
+
         log("发现 %d 个新帖: %s" % (len(fresh), ", ".join(str(t) for t, _ in fresh)))
 
         limit = self.cfg.get("daily_limit", 20)

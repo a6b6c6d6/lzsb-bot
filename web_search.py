@@ -184,11 +184,18 @@ def search(query, topk=5, timeout=12, proxy='', sources=None):
         try:
             for f in as_completed(futs, timeout=timeout + 8):
                 try:
-                    results.extend(f.result() or [])
+                    for r in (f.result() or []):
+                        r['_src'] = futs[f]      # 记录来源,便于按优先级排序
+                        results.append(r)
                 except Exception:
                     pass          # 单源失败静默:搜索引擎经常限流/改版
         except Exception:
             pass                  # 整体超时:已拿到的照常用
+
+    # 按 names 的先后顺序排列(并行竞速的完成顺序是随机的,不排序会让
+    # Bing 这类噪音源的结果挤到前面,盖掉 Google News 的高质量结果)
+    order = {n: i for i, n in enumerate(names)}
+    results.sort(key=lambda r: order.get(r.get('_src'), 99))
 
     seen, out = set(), []
     for r in results:
@@ -197,6 +204,7 @@ def search(query, topk=5, timeout=12, proxy='', sources=None):
         if not key or key in seen:
             continue
         seen.add(key)
+        r.pop('_src', None)
         out.append(r)
     return out[:topk]
 
