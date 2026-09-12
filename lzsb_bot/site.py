@@ -68,7 +68,8 @@ class LsbSite:
                 log("检测到 Cap 人机验证,开始求解(约 10-20 秒)……")
                 t0 = time.time()
                 cap_token = get_cap_token(
-                    self.http, m.group(1), referer=self.base + "/login") or ""
+                    self.http, m.group(1), referer=self.base + "/login",
+                    node_path=(self.cfg.get("node_path") or "").strip() or None)
                 log("Cap 验证通过,耗时 %.1fs" % (time.time() - t0))
             except Exception as e:
                 log("Cap 求解失败: %s" % e, "ERROR")

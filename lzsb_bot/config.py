@@ -35,6 +35,7 @@ DEFAULTS = {
     "proxy": "",
     "timeout": 30,
     "user_agent": "",
+    "node_path": "",
 
     "username": "",
     "password": "",

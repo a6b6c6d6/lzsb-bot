@@ -26,10 +26,11 @@ def challenge_headers(referer='https://linux.sb/login'):
     }
 
 
-def get_cap_token(http, endpoint, referer='https://linux.sb/login'):
+def get_cap_token(http, endpoint, referer='https://linux.sb/login', node_path=None):
     """走完 challenge -> PoW -> instrumentation -> redeem,返回 cap_token。
 
     http 需提供 `post(url, data, extra_headers=...)` 与 `.opener`。
+    node_path —— config 里的 node 可执行文件路径(可选)。
     """
     ep = endpoint if endpoint.endswith('/') else endpoint + '/'
     hdrs = challenge_headers(referer)
@@ -47,7 +48,7 @@ def get_cap_token(http, endpoint, referer='https://linux.sb/login'):
     # --- 3. instrumentation ---
     instr = None
     if resp.get('instrumentation'):
-        instr = solve_instrumentation(resp['instrumentation'])
+        instr = solve_instrumentation(resp['instrumentation'], node_path=node_path)
 
     # --- 4. redeem ---
     payload = {'token': token, 'solutions': sols}

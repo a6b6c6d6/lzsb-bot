@@ -529,7 +529,10 @@ class Bot:
 
             if self.once:
                 break
-            self.sleep(self.cfg.get("poll_interval", 60))
+            # 轮询节奏加 ±15% 抖动:固定整点间隔的行为特征太明显
+            interval = int(self.cfg.get("poll_interval", 60) or 60)
+            jitter = max(1, int(interval * 0.15))
+            self.sleep(max(5, interval + random.randint(-jitter, jitter)))
 
         self.store.close()
         log("机器人已停止")

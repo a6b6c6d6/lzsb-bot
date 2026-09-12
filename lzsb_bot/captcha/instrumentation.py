@@ -39,18 +39,33 @@ import zlib
 
 from .pow import M  # noqa: F401  (保持包内导入一致性)
 
-# Node 可执行文件候选:Windows / Termux(Android) / 通用 Linux 都覆盖。
-# 顺序上先找确定存在的绝对路径,最后回退到 PATH 里的 node。
+# Node 可执行文件探测顺序:config 指定路径 → 常见安装位置 → PATH。
+# 全部走通用位置,不依赖任何个人环境;装在非标准位置的用户在 config.json
+# 里填 node_path 即可。
 NODE_CANDIDATES = [
-    r'C:\Users\user\.mytools\binaries\node\versions\22.22.2-3\node.exe',
-    r'C:\Users\user\.mytools\binaries\node\versions\24.19.0\node.exe',
-    r'D:\mytools\NodeTools\node.exe',
     '/data/data/com.termux/files/usr/bin/node',   # Termux(Android)
     '/usr/bin/node',
     '/usr/local/bin/node',
     '/opt/homebrew/bin/node',
-    'node',
 ]
+
+
+def find_node(extra=None):
+    """定位 node 可执行文件;找不到返回 None。"""
+    if extra and os.path.isfile(extra):
+        return extra
+    for p in NODE_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    # Windows 常见安装位置(PATH 里往往没有 node)
+    for env_key, sub in (('ProgramFiles', r'\nodejs\node.exe'),
+                         ('LOCALAPPDATA', r'\Programs\nodejs\node.exe'),
+                         ('ProgramFiles(x86)', r'\nodejs\node.exe')):
+        base = os.environ.get(env_key)
+        if base and os.path.isfile(base + sub):
+            return base + sub
+    return shutil.which('node') or 'node'
+
 
 _UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) '
        'Gecko/20100101 Firefox/142.0')
@@ -77,16 +92,6 @@ globalThis.document = { createElement:(t)=>new El(t), body: new El('body') };
 _VARS_RE = re.compile(r'var \w+=\d+;var \w+=\d+;var \w+=\d+;var \w+=\d+;')
 
 
-def find_node():
-    """定位 node 可执行文件;找不到返回 None。"""
-    for p in NODE_CANDIDATES:
-        if p == 'node':
-            return shutil.which('node') or 'node'
-        if os.path.exists(p):
-            return p
-    return None
-
-
 def _extract_calc_body(script):
     """从脚本里抽出「计算层」代码,绕过检测层。返回 (代码, state 变量名)。"""
     m = _VARS_RE.search(script)
@@ -106,17 +111,18 @@ def _extract_calc_body(script):
     return script[start:end], m2.group(1)
 
 
-def solve_instrumentation(instr_b64, timeout=25):
+def solve_instrumentation(instr_b64, timeout=25, node_path=None):
     """解压 instrumentation 脚本,在 Node + DOM shim 里跑出 state。
 
     返回服务端期望的 instr 对象:{i, state:{...}, ts}
+    node_path —— config.json 里的 node_path(PATH 探测不到时用)
     """
     import time as _time
 
     raw = base64.b64decode(instr_b64)
     script = zlib.decompress(raw, -15).decode('utf-8', 'replace')
 
-    node = find_node()
+    node = find_node(node_path)
     if not node:
         raise RuntimeError('找不到 node,无法执行 instrumentation(请安装 nodejs)')
 

@@ -5,6 +5,8 @@
   "base_url": "https://linux.sb",
   "proxy": "http://127.0.0.1:7897",
   "timeout": 30,
+  "_node_path说明": "node 可执行文件路径。留空自动探测(PATH + 常见安装位置);node 装在非标准位置才需要填完整路径",
+  "node_path": "",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0",
 
   "username": "",
