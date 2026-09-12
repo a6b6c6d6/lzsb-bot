@@ -72,6 +72,7 @@ DEFAULTS = {
     "notify_reply_enabled": True,
     "notify_max_per_tick": 2,
     "passive_mode": False,
+    "notify_allow_dm": True,
 
     # ---- 联网搜索 ----
     "enable_search": True,

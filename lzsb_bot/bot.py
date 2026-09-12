@@ -14,6 +14,7 @@
 
 import random
 import re
+import json
 import time
 from datetime import datetime
 
@@ -215,6 +216,104 @@ class Bot:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _parse_notify_json(text):
+        """从模型输出提取 {"channel","reply"}。
+
+        弱模型的 JSON 常见毛病:包 ```json 围栏、前后带说明文字、换行没转义。
+        三层兜底:整体 loads → 截取 {..} 再 loads → 正则抠 channel/reply 字段。
+        全部失败返回 (None, None),调用方按公开回复兜底。
+        """
+        t = (text or "").strip()
+        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
+        candidates = [t]
+        i, j = t.find("{"), t.rfind("}")
+        if 0 <= i < j:
+            candidates.append(t[i:j + 1])
+        for c in candidates:
+            try:
+                obj = json.loads(c)
+                if isinstance(obj, dict) and obj.get("reply"):
+                    ch = str(obj.get("channel") or "post").strip().lower()
+                    return ("dm" if ch == "dm" else "post"), str(obj["reply"]).strip()
+            except (ValueError, TypeError):
+                pass
+        m_ch = re.search(r'"channel"\s*:\s*"([^"]*)"', t)
+        m_re = re.search(r'"reply"\s*:\s*"((?:[^"\\]|\\.)*)"', t, re.S)
+        if m_re:
+            raw = m_re.group(1)
+            # 弱模型经常输出非法 JSON(字符串里有真实换行等),json.loads 会失败;
+            # 这里手工解转义,保住换行格式
+            raw = raw.replace('\\\\', '\x00').replace('\\n', '\n') \
+                     .replace('\\t', ' ').replace('\\"', '"') \
+                     .replace('\\/', '/').replace('\x00', '\\')
+            ch = (m_ch.group(1).strip().lower() if m_ch else "post")
+            return ("dm" if ch == "dm" else "post"), raw.strip()
+        return None, None
+
+    @staticmethod
+    def _clean_reply_text(reply):
+        """回复正文最后清理:剥掉模型漏写的渠道标记/Markdown 加粗符号。"""
+        if not reply:
+            return reply
+        r = reply.strip()
+        r = re.sub(r'^\s*\[(?:DM|帖|公开|私信)\]\s*', '', r, flags=re.I)
+        r = r.replace('**', '')
+        r = r.replace('\\n', '\n')          # 漏解码的换行转义
+        r = re.sub(r'\n{3,}', '\n\n', r)
+        return r.strip()
+
+    # 提示词泄漏/注入得手的特征:回复里出现内部提示词片段或元话语。
+    # 模型被注入的概率无法降为零,这里是最后一道代码防线。
+    LEAK_MARKERS = (
+        "NOTIFY_SYSTEM", "DEFAULT_SYSTEM_PROMPT", "PLAN_SYSTEM",
+        "热心老用户,大家有事会 @ 你", "对方给你派了任务",
+        "ignore all previous", "ignore previous instructions",
+        "disregard all previous",
+    )
+
+    # 常见顶级域名:用于从回复里抠出"域名",与源材料比对
+    DOMAIN_RE = re.compile(
+        r'([a-z0-9][a-z0-9-]*\.(?:com|net|org|cn|io|me|cc|xyz|top|app|dev|site|online))')
+
+    @classmethod
+    def _strip_unknown_links(cls, text, source=""):
+        """移除回复中引用了源材料里不存在的域名/链接的行(疑似注入打广告)。
+
+        注入得手的典型形态:模型被诱导在回复末尾加"访问 xxx.com 领取奖励"。
+        源材料(帖子正文+楼层+搜索结果)里出现过的域名视为合法,
+        其余域名的整行删掉;删完太短(<30字)交由调用方按失败处理。
+        返回 (清理后文本, 是否删过东西)。
+        """
+        if not text:
+            return text, False
+        src = (source or '').lower()
+        out, removed = [], False
+        for line in text.split('\n'):
+            domains = cls.DOMAIN_RE.findall(line.lower())
+            bad = [d for d in domains if d not in src and d != 'linux.sb']
+            if bad:
+                removed = True
+                continue
+            out.append(line)
+        cleaned = '\n'.join(out).strip()
+        # 注意:即使删完剩得很短也返回清理后的文本 —— 短而干净好过长而带毒,
+        # 是否可接受由调用方的 poisoned/长度检查决定
+        return cleaned, removed
+
+    @classmethod
+    def _reply_poisoned(cls, text):
+        """生成结果的注入兜底检查。True = 疑似被注入/泄漏,不应发布。"""
+        if not text or len(text.strip()) < 5:
+            return True
+        low = text.lower()
+        for m in cls.LEAK_MARKERS:
+            if m.lower() in low:
+                return True
+        if text.count("http") > 3:            # 疑似被利用发垃圾链接
+            return True
+        return False
+
+    @staticmethod
     def _drop_question_sentences(text):
         """兜底防线:删掉含问号的短语。
 
@@ -298,21 +397,10 @@ class Bot:
             self.store.save_notif(rid, tid, from_user, n["kind"], "skip:已锁帖")
             return False
 
-        # 楼层定位:接话必须用「@用户 #对方所在楼层」才能盖在对方的楼里,
-        # 只 @ 用户名会变成一条独立新评论。楼层号是**对方那条回复**所在的楼
-        # (站点约定:回复从 #1 起,不含楼主;通知摘要里的 #N 是对方回复的
-        # 目标楼层,不能拿来用!),定位不到就退化为纯 @ 提及,宁可不盖楼
-        # 也不能盖错楼回错人。
-        floor, their_text_full = self.site.locate_floor(tid, rid)
-        their_text = their_text_full or n["text"] or ""
-        if floor is None:
-            log("  通知接话: 未能定位 %s 的回复楼层(审核隐藏/已删除),改用纯 @ 提及"
-                % from_user, "WARN")
-        mention = "@%s" % from_user + (" #%d" % floor if floor else "")
-
+        # 渠道(dm=私信 / post=帖子内回复)与回复内容由模型判断,输出 JSON。
         text, err = call_llm(
             self.cfg, NOTIFY_SYSTEM,
-            build_notify_user_prompt(topic, from_user, their_text, n["text"]))
+            build_notify_user_prompt(topic, from_user, n["text"], n["text"]))
         if err or not text:
             # LLM 临时故障(限速/无渠道)不该消费掉通知:不标记,留待下轮重试;
             # 连续 3 次都失败才标记放弃,防止接口长期宕机时空转
@@ -326,7 +414,83 @@ class Bot:
             else:
                 log("  通知接话:LLM 暂不可用(第 %d 次),下轮重试 #%d" % (n_fail, tid), "WARN")
             return False
-        text = "%s %s" % (mention, self._drop_question_sentences(text.strip()))
+
+        channel, reply = self._parse_notify_json(text)
+        if not reply:
+            channel, reply = "post", text
+            log("  通知接话: JSON 解析失败,按公开回复兜底", "WARN")
+        reply = self._clean_reply_text(self._drop_question_sentences(reply.strip()))
+        # 注入兜底:回复中出现源材料里不存在的域名 → 删该行;泄漏/过短 → 重试
+        # ⚠ 源材料只含帖子内容,**不含对方的 @ 消息** —— 注入文本里若带垃圾域名,
+        #   混进白名单就会让清除逻辑失效(实测踩过)
+        source = ((topic.get("content") or "") + " "
+                  + " ".join((p.get("content") or "") for p in (topic.get("posts") or [])))
+        reply, removed = self._strip_unknown_links(reply, source)
+        if removed:
+            log("  已移除回复中来源不明的链接内容(疑似注入)", "WARN")
+        if not reply or len(reply) < 30 or self._reply_poisoned(reply):
+            # 注入兜底:疑似泄漏/异常内容不发布。不消费通知,重试 3 次才放弃
+            n_fail = self.notif_llm_fail.get(rid, 0) + 1
+            self.notif_llm_fail[rid] = n_fail
+            if n_fail >= 3:
+                self.store.save_notif(rid, tid, from_user, n["kind"],
+                                      "fail:疑似注入/空回复 x3")
+                self.notif_llm_fail.pop(rid, None)
+                log("  通知接话放弃 #%d:回复疑似注入或为空,连续 3 次" % tid, "ERROR")
+            else:
+                log("  通知接话: 回复疑似注入泄漏或为空(第 %d 次),丢弃重试" % n_fail, "WARN")
+            return False
+
+        if channel == "dm" and not self.cfg.get("notify_allow_dm", True):
+            log("  模型选择私信渠道,但 notify_allow_dm=false,改为帖子内回复", "WARN")
+            channel = "post"
+
+        if channel == "dm":
+            # ---- 私信渠道:不需要楼层号,直接发给对方 ----
+            log("  ---- 通知接话 #%d(%s 要求/适合私信) ----\n%s\n  ----------------"
+                % (tid, from_user, reply))
+            if self.dry:
+                self.store.save_notif(rid, tid, from_user, n["kind"], "ok(dry:dm)")
+                log("  [DRY-RUN] 私信未发送")
+                return True
+            delay = random.randint(self.cfg.get("reply_delay_min", 10),
+                                   self.cfg.get("reply_delay_max", 30))
+            log("  随机等待 %d 秒后发送私信……" % delay)
+            for _ in range(delay):
+                if not self.running:
+                    return False
+                time.sleep(1)
+            ok, msg = self.site.send_dm(n.get("from_uid") or 0, reply[:490])
+            if not ok and ("未找到私信表单" in (msg or "") or "私信页打开失败" in (msg or "")):
+                # 会话失效类症状:不消费,强制重登,下轮重试,连续 3 次才放弃
+                n_fail = self.notif_submit_fail.get(rid, 0) + 1
+                self.notif_submit_fail[rid] = n_fail
+                self._maybe_relogin("私信发送会话失效")
+                if n_fail >= 3:
+                    self.store.save_notif(rid, tid, from_user, n["kind"],
+                                          "fail:x3 私信会话失效 %s" % msg)
+                    self.notif_submit_fail.pop(rid, None)
+                    log("  通知接话放弃 #%d:私信会话失效连续 3 次" % tid, "ERROR")
+                else:
+                    log("  私信发送失败(%s),重登后下轮重试(第 %d 次)" % (msg, n_fail), "WARN")
+                return True
+            self.notif_submit_fail.pop(rid, None)
+            self.store.save_notif(rid, tid, from_user, n["kind"],
+                                  "ok(dm)" if ok else "fail:dm %s" % msg)
+            if ok:
+                self.store.incr_today()
+                log("  已私信 %s: %s" % (from_user, msg))
+            else:
+                log("  私信发送失败 #%d: %s(不重试,防止重复发送)" % (tid, msg), "WARN")
+            return True
+
+        # ---- 公开渠道:定位对方楼层,盖楼回复(楼层号是对方那条回复所在的楼) ----
+        floor, their_text_full = self.site.locate_floor(tid, rid)
+        if floor is None:
+            log("  通知接话: 未能定位 %s 的回复楼层(审核隐藏/已删除),改用纯 @ 提及"
+                % from_user, "WARN")
+        mention = "@%s" % from_user + (" #%d" % floor if floor else "")
+        text = "%s %s" % (mention, reply)
         log("  ---- 通知接话 #%d(%s 在 %s 提到你) ----\n%s\n  ----------------"
             % (tid, from_user, ("#%d 楼" % floor) if floor else "主题", text))
 
@@ -445,6 +609,18 @@ class Bot:
             log("  LLM 失败: %s" % err, "ERROR")
             return
         text = re.sub(r"\s+\n", "\n", text).strip()
+        # 注入兜底:回复中来源不明的域名整行移除(源材料 = 帖子 + 搜索结果)
+        source = ((topic.get("content") or "") + " "
+                  + " ".join((p.get("content") or "") for p in (topic.get("posts") or []))
+                  + " " + (search_block or ""))
+        text, removed = self._strip_unknown_links(text, source)
+        if removed:
+            log("  已移除回复中来源不明的链接内容(疑似注入)", "WARN")
+        if self._reply_poisoned(text):
+            # 注入兜底:疑似提示词泄漏/垃圾内容,丢弃不发布(帖子保持已见,不重试)
+            log("  回复疑似提示词泄漏或垃圾内容,已丢弃不发布: #%d" % tid, "WARN")
+            return
+        text = text[:600]                     # 公开回复硬上限,防被注入刷长文
         log("  ---- 拟回复 ----\n%s\n  ----------------" % text)
 
         if self.dry:
