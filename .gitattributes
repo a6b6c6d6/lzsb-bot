@@ -1,0 +1,7 @@
+# Windows 批处理必须 CRLF(cmd 解析 LF 会崩),shell 脚本必须 LF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh  text eol=lf
+*.py  text eol=lf
+*.json text eol=lf
+*.md  text eol=lf

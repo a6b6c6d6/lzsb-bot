@@ -1,14 +1,23 @@
 @echo off
 chcp 65001 >nul
 title linux.sb 自动回帖机器人
-cd /d "%~dp0"
 
+set "BOTDIR=C:/Users/user/ToolsDir/2026-09-11-18-41-53/lzsb-bot"
+cd /d "%BOTDIR%"
+
+if not exist "lzsb_bot" (
+  echo [错误] 找不到程序包 lzsb_bot
+  echo        请确认项目目录还在: %BOTDIR%
+  echo.
+  pause
+  exit /b 1
+)
+
+rem 优先用确定存在的绝对路径,最后才回退 where python
 set "PY="
-where python >nul 2>nul && set "PY=python"
-if not defined PY if exist "D:\python\python.exe" set "PY=D:\python\python.exe"
-if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
-if not defined PY if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-if not defined PY if exist "C:\Users\user\.mytools\binaries\python\versions\3.13.12\python.exe" set "PY=C:\Users\user\.mytools\binaries\python\versions\3.13.12\python.exe"
+if exist "C:/Users/user/.mytools/binaries/python/versions/3.13.12/python.exe" set "PY=C:/Users/user/.mytools/binaries/python/versions/3.13.12/python.exe"
+if not defined PY if exist "D:/python/python.exe" set "PY=D:/python/python.exe"
+if not defined PY where python >nul 2>nul && set "PY=python"
 
 if not defined PY (
   echo [错误] 没有找到 Python，请先安装 Python 3 并在安装时勾选 "Add to PATH"。
@@ -38,6 +47,7 @@ if not exist "llm.json" (
 echo ==================================================
 echo   linux.sb 自动回帖机器人
 echo   配置文件: config.json（站点/搜索） + llm.json（AI 接口）
+echo   提醒: 运行期间 Clash 代理必须保持开启
 echo   按 Ctrl+C 可随时安全停止
 echo ==================================================
 echo.
