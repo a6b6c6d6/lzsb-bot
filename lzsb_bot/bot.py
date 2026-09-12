@@ -21,7 +21,8 @@ from .config import SEARCH_MODE_LABELS
 from .filters import should_reply
 from .log import log
 from .llm import call_llm, extract_keywords
-from .prompt import DEFAULT_SYSTEM_PROMPT, PLAN_SYSTEM, build_user_prompt
+from .prompt import (DEFAULT_SYSTEM_PROMPT, NOTIFY_SYSTEM, PLAN_SYSTEM,
+                     build_notify_user_prompt, build_user_prompt)
 from .site import LsbSite
 from .store import Store
 from .search import search as web_search
@@ -37,6 +38,7 @@ class Bot:
         self.site = LsbSite(cfg)
         self.running = True
         self.fail_count = {}          # tid -> 已失败次数(仅内存,重启清零)
+        self.notif_fail = {}          # rid -> 通知对应帖子打不开的次数(仅内存)
         self.system_prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
 
     # ------------------------------------------------------------------
@@ -189,6 +191,134 @@ class Bot:
             % (len(items), new_marked))
 
     # ------------------------------------------------------------------
+    # 通知接话(水他模式:有人回复/提及 bot 就去接话)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _drop_question_sentences(text):
+        """兜底防线:删掉含问号的短语。
+
+        弱模型经常无视"不要问号"的指令;站点氛围下回帖带问号容易显得挑事。
+        策略:把「上一句终点(。！…~”)之后一直到 ？(含)」的片段整段删掉,
+        只伤发问的那半句,保住其余内容;删完太短才保底返回原文。
+        """
+        if "？" not in text and "?" not in text:
+            return text
+        out = re.sub(r"[^。！…~”]*[？?]\s*", "", text).strip()
+        return out if len(out) >= 10 else text
+
+    def _handle_notifications(self):
+        """处理「我的通知」:有人回复/提及 bot 时,针对对方的话生成一条
+        接话回复(等同水贴脚本的「水他」)。
+
+        去重键 = 触发通知的回复 id(rid),处理过就永不再碰;
+        只处理 提及/回复 两类,其余类型(系统通知等)标记跳过。
+        回复正文自动加 @对方,让对方收到通知,形成正常对话。
+        """
+        if not self.cfg.get("notify_reply_enabled", True):
+            return
+        maxn = int(self.cfg.get("notify_max_per_tick", 2) or 0)
+        if maxn <= 0:
+            return
+        if not self.dry and self.store.today_count() >= self.cfg.get("daily_limit", 20):
+            return
+
+        try:
+            items = self.site.fetch_notifications()
+        except Exception as e:
+            log("拉取通知失败(忽略): %s" % e, "WARN")
+            return
+        fresh = [n for n in items if not self.store.has_notif(n["rid"])]
+        if not fresh:
+            return
+        log("通知: %d 条新(提及/回复)" % len(fresh))
+
+        bot_name = self.cfg.get("bot_username") or ""
+        handled = 0
+        for n in fresh:
+            if not self.running:
+                return
+            rid, tid, from_user, kind = n["rid"], n["tid"], n["from_user"], n["kind"]
+
+            if kind not in ("提及", "回复"):
+                self.store.save_notif(rid, tid, from_user, kind, "skip:类型")
+                continue
+            if from_user == bot_name:
+                self.store.save_notif(rid, tid, from_user, kind, "skip:自己")
+                continue
+            if handled >= maxn:
+                continue                      # 留给下一轮,不标记
+            if not self.dry and self.store.today_count() >= self.cfg.get("daily_limit", 20):
+                return
+
+            try:
+                if self._handle_one_notification(n):
+                    handled += 1              # 只有真的尝试接话才占名额
+            except Exception as e:
+                self.store.save_notif(rid, tid, from_user, kind, "fail:%s" % e)
+                log("  通知处理异常 #%s: %s" % (rid, e), "ERROR")
+
+    def _handle_one_notification(self, n):
+        """处理单条通知。返回 True = 真的尝试了接话;False = 跳过(不占名额)。"""
+        rid, tid, from_user = n["rid"], n["tid"], n["from_user"]
+        topic = self.site.fetch_topic(tid)
+        if not topic:
+            # 多半是代理抖动:不消费,重试 3 次后才放弃,防止坏帖占死队列
+            n_fail = self.notif_fail.get(rid, 0) + 1
+            self.notif_fail[rid] = n_fail
+            if n_fail >= 3:
+                self.store.save_notif(rid, tid, from_user, n["kind"], "skip:帖子打不开x3")
+                self.notif_fail.pop(rid, None)
+                log("  通知接话放弃 #%d:连续 3 次打不开" % tid, "WARN")
+            else:
+                log("  通知接话: #%d 打不开(第 %d 次),下轮重试" % (tid, n_fail), "WARN")
+            return False
+        self.notif_fail.pop(rid, None)
+        if topic.get("closed"):
+            self.store.save_notif(rid, tid, from_user, n["kind"], "skip:已锁帖")
+            return False
+
+        # 按 rid 定位对方那条回复拿全文(通知页里的摘要可能被截断)
+        their = next((p for p in (topic.get("posts") or [])
+                      if str(p.get("pid")) == str(rid)), None)
+        their_text = (their or {}).get("content") or n["text"] or ""
+
+        text, err = call_llm(
+            self.cfg, NOTIFY_SYSTEM,
+            build_notify_user_prompt(topic, from_user, their_text, n["text"]))
+        if err or not text:
+            self.store.save_notif(rid, tid, from_user, n["kind"],
+                                  "fail:LLM %s" % (err or "空"))
+            log("  通知接话生成失败: %s" % err, "ERROR")
+            return False                     # 下轮重试
+        text = "@%s %s" % (from_user, self._drop_question_sentences(text.strip()))
+        log("  ---- 通知接话 #%d(%s 提到你) ----\n%s\n  ----------------"
+            % (tid, from_user, text))
+
+        if self.dry:
+            self.store.save_notif(rid, tid, from_user, n["kind"], "ok(dry)")
+            log("  [DRY-RUN] 未提交")
+            return True
+
+        delay = random.randint(self.cfg.get("reply_delay_min", 10),
+                               self.cfg.get("reply_delay_max", 30))
+        log("  随机等待 %d 秒后提交……" % delay)
+        for _ in range(delay):
+            if not self.running:
+                return False
+            time.sleep(1)
+
+        ok, msg = self.site.submit_reply(tid, text)
+        self.store.save_notif(rid, tid, from_user, n["kind"],
+                              "ok" if ok else "fail:%s" % msg)
+        if ok:
+            self.store.incr_today()
+            log("  已回复 %s 在 #%d: %s" % (from_user, tid, msg))
+        else:
+            log("  通知接话提交失败 #%d: %s(不重试,防止重复接话)" % (tid, msg), "WARN")
+        return True
+
+    # ------------------------------------------------------------------
     # 单轮
     # ------------------------------------------------------------------
 
@@ -320,6 +450,11 @@ class Bot:
                 % int(cfg.get("donate_amount", 1) or 0))
         else:
             log("  自动打赏  : 关闭")
+        if cfg.get("notify_reply_enabled", True):
+            log("  通知接话  : 开启,每轮最多处理 %d 条提及/回复"
+                % int(cfg.get("notify_max_per_tick", 2) or 0))
+        else:
+            log("  通知接话  : 关闭")
         log("  AI 接口   : %s" % ", ".join(
             p.get("name") or p.get("model") or "?"
             for p in (cfg.get("llm", {}).get("providers") or [])[:4]))
@@ -365,6 +500,7 @@ class Bot:
 
             try:
                 self.tick()
+                self._handle_notifications()
             except Exception as e:
                 log("本轮异常: %s: %s" % (type(e).__name__, e), "ERROR")
 

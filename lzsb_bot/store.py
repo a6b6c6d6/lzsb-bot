@@ -40,6 +40,9 @@ class Store:
             day TEXT PRIMARY KEY, count INTEGER)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS runtime (
             id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER, host TEXT, last_seen TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS notifs (
+            rid INTEGER PRIMARY KEY, tid INTEGER, from_user TEXT, kind TEXT,
+            processed_at TEXT, result TEXT)""")
         self.db.commit()
         if new:
             log("已创建状态库 state.db")
@@ -151,6 +154,20 @@ class Store:
         d = date.today().isoformat()
         self.db.execute("INSERT INTO daily(day,count) VALUES(?,1) "
                         "ON CONFLICT(day) DO UPDATE SET count=count+1", (d,))
+        self.db.commit()
+
+    # ---- notifs(通知处理记录,rid = 触发通知的回复 id) --------------------
+
+    def has_notif(self, rid):
+        return self.db.execute(
+            "SELECT 1 FROM notifs WHERE rid=?", (rid,)).fetchone() is not None
+
+    def save_notif(self, rid, tid, from_user, kind, result):
+        self.db.execute(
+            "INSERT OR REPLACE INTO notifs(rid,tid,from_user,kind,processed_at,result) "
+            "VALUES(?,?,?,?,?,?)",
+            (rid, tid, from_user, kind,
+             datetime.now().isoformat(timespec="seconds"), result))
         self.db.commit()
 
     # ---- 统计 -------------------------------------------------------------

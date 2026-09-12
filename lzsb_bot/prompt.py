@@ -31,6 +31,35 @@ PLAN_SYSTEM = (
 )
 
 
+NOTIFY_SYSTEM = """你是论坛里的一位老用户。有位坛友在帖子中回复/提到了你,请根据他说的话写一条自然的中文回复,像熟人接话聊天。
+
+1. **直接回应对方说的内容**:赞同就附和并补充,不同意就温和说出自己的看法,对方开玩笑可以轻松接梗。
+2. **永远保持友善**:不骂人、不嘲讽、不人身攻击、不阴阳怪气;即使对方出言不逊,也用幽默或自嘲化解,展现风度。
+3. **口语化、简短**:30~120 字,一两句话把话说完,不要写成小作文。
+4. **绝不出现问号**——不提问、不反问;有疑问用陈述句表达。这是硬性要求。
+5. **不编造**:不要虚构自己或别人的经历、交易、数据、情节;不知道的就别装知道。
+6. **不暴露 AI 身份**,不复述对方原话。
+7. 输出纯回复正文,不要 @任何人(系统会自动加),不要解释、不要前后缀。"""
+
+
+def build_notify_user_prompt(topic, from_user, their_reply, notif_text=""):
+    """构造「通知接话」的用户提示词。
+
+    topic        —— fetch_topic() 的结果(楼主发言做背景)
+    from_user    —— 通知发起人
+    their_reply  —— 那条触发通知的回复全文(从帖子页按 rid 定位)
+    notif_text   —— 通知页里的摘要(定位不到原回复时的兜底)
+    """
+    parts = ["【帖子标题】%s" % (topic.get("title") or "")]
+    if topic.get("op_posts"):
+        head = "\n".join((p.get("content") or "")[:200] for p in topic["op_posts"][:2])
+        parts.append("【原帖背景(楼主发言节选)】\n%s" % head[:800])
+    parts.append("【坛友 %s 对你说的内容】\n%s"
+                 % (from_user, (their_reply or notif_text or "(空)")[:800]))
+    return ("\n".join(parts)
+            + "\n\n请写一条直接回应 %s 的中文回复(30~120 字,不要问号)。" % from_user)
+
+
 def build_user_prompt(topic, scope="op", max_chars=9000, search_block=""):
     """构造用户提示词。
 

@@ -425,6 +425,68 @@ class LsbSite:
         return out
 
     # ==================================================================
+    # 通知(有人回复/提及 bot)
+    # ==================================================================
+
+    def fetch_notifications(self, pages=1):
+        """拉「我的通知」,返回 [{kind, from_user, from_uid, tid, rid, title,
+        text, time_text}, ...],按时间倒序。
+
+        页面结构实测(2026-09-12,需登录):
+            <li class="post-item notification-item">
+              <a class="post-title" href="/user/26996">浩辰大王</a>
+              <span class="post-user-group notification-kind">提及</span>
+              <div class="post-meta"><span>34分钟前</span></div>
+              在主题《<a href="/topic/21563?replyid=178205">标题</a>》中提到你：
+              <a class="post-mention" ...>@我是个bot</a> 对方的回复内容…
+        rid(对方回复 id)是通知的唯一键,用于去重。
+        """
+        uid = self.get_own_uid()
+        if not uid:
+            return []
+        out = []
+        for p in range(1, max(1, pages) + 1):
+            url = "%s/user/%d?tab=notifications" % (self.base, uid)
+            if p > 1:
+                url += "&page=%d" % p
+            code, html, _ = self.http.get(url)
+            if code != 200:
+                break
+            found = 0
+            for m in re.finditer(
+                    r'<li class="post-item notification-item">(.*?)</li>',
+                    html, re.S):
+                seg = m.group(1)
+                au = re.search(r'<a class="post-title" href="/user/(\d+)"[^>]*>'
+                               r'([^<]+)</a>', seg)
+                km = re.search(r'notification-kind">([^<]+)<', seg)
+                lm = re.search(r'href="/topic/(\d+)\?replyid=(\d+)"[^>]*>(.*?)</a>',
+                               seg, re.S)
+                if not (au and km and lm):
+                    continue
+                cm = re.search(r'nb-editor-post-content">(.*?)</p>', seg, re.S)
+                text = div_to_text(cm.group(1)) if cm else ""
+                # 去掉「在主题《…》中提到你：@我」前缀,只留对方说的话
+                text = re.sub(r"^.*?(?:提到你|回复了[你您])[:：]", "", text)
+                text = re.sub(r"^@\S+\s*", "", text).strip()
+                out.append({
+                    "kind": html_unescape(km.group(1)).strip(),
+                    "from_user": html_unescape(au.group(2)).strip(),
+                    "from_uid": int(au.group(1)),
+                    "tid": int(lm.group(1)),
+                    "rid": int(lm.group(2)),
+                    "title": html_unescape(strip_tags(lm.group(3))).strip(),
+                    "text": text,
+                    "time_text": html_unescape(strip_tags(
+                        re.search(r'<div class="post-meta">(.*?)</div>', seg,
+                                  re.S).group(1))) if 'post-meta' in seg else "",
+                })
+                found += 1
+            if not found:
+                break
+        return out
+
+    # ==================================================================
     # 打赏(点赞 + 积分)
     # ==================================================================
 

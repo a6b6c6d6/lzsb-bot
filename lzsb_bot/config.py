@@ -67,6 +67,10 @@ DEFAULTS = {
     # ---- 跨端同步 ----
     "sync_replies_pages": 2,
 
+    # ---- 通知接话(有人回复/提及 bot 时去接话) ----
+    "notify_reply_enabled": True,
+    "notify_max_per_tick": 2,
+
     # ---- 联网搜索 ----
     "enable_search": True,
     "search_mode": SEARCH_MODE_SMART,

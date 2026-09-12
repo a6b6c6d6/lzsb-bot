@@ -54,6 +54,10 @@
   "_跨端同步说明": "启动时从个人主页「回复」标签页(公开页面)拉取 bot 站点上已有的回复并标记到本地,手机/电脑两端各跑也不会重复回帖。sync_replies_pages = 同步几页(0 = 关闭)",
   "sync_replies_pages": 2,
 
+  "_通知接话说明": "轮询时检查「我的通知」,有人回复/提及 bot 就针对对方的话自动接话(类似水贴脚本的水他)。回复自动带 @对方。notify_reply_enabled = 是否开启;notify_max_per_tick = 每轮最多接话几条;计入每日上限",
+  "notify_reply_enabled": true,
+  "notify_max_per_tick": 2,
+
   "_联网搜索说明": "enable_search = 是否联网(默认开);搜索前先用 AI 提炼关键词,把结果作为背景资料喂给模型",
   "enable_search": true,
   "_search_mode说明": "联网搜索模式,填 1 / 2 / 3 即可。1 = 智能路由(中英分流·多主源并行,默认);2 = 多源聚合(只打官方 JSON/RSS 接口,无反爬无广告);3 = Bing 单源直连(通用兜底,结果偏杂)",
