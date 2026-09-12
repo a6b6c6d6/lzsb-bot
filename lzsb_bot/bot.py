@@ -39,6 +39,7 @@ class Bot:
         self.running = True
         self.fail_count = {}          # tid -> 已失败次数(仅内存,重启清零)
         self.notif_fail = {}          # rid -> 通知对应帖子打不开的次数(仅内存)
+        self.notif_llm_fail = {}      # rid -> LLM 连续失败次数(仅内存)
         self.system_prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
 
     # ------------------------------------------------------------------
@@ -279,21 +280,43 @@ class Bot:
             return False
 
         # 按 rid 定位对方那条回复拿全文(通知页里的摘要可能被截断)
-        their = next((p for p in (topic.get("posts") or [])
-                      if str(p.get("pid")) == str(rid)), None)
+        posts = topic.get("posts") or []
+        their = next((p for p in posts if str(p.get("pid")) == str(rid)), None)
         their_text = (their or {}).get("content") or n["text"] or ""
+
+        # 楼层号:接话必须用「@用户 #楼层」才能盖在对方的楼里,
+        # 只 @ 用户名会变成一条独立新评论(站点约定)
+        floor = None
+        if their is not None:
+            try:
+                floor = posts.index(their) + 1      # 文档顺序即楼层顺序
+            except ValueError:
+                floor = None
+        if floor is None:
+            mf = re.match(r"#(\d+)", (n["text"] or "").strip())   # 通知摘要里的 #N 兜底
+            if mf:
+                floor = int(mf.group(1))
+        mention = "@%s" % from_user + (" #%d" % floor if floor else "")
 
         text, err = call_llm(
             self.cfg, NOTIFY_SYSTEM,
             build_notify_user_prompt(topic, from_user, their_text, n["text"]))
         if err or not text:
-            self.store.save_notif(rid, tid, from_user, n["kind"],
-                                  "fail:LLM %s" % (err or "空"))
-            log("  通知接话生成失败: %s" % err, "ERROR")
-            return False                     # 下轮重试
-        text = "@%s %s" % (from_user, self._drop_question_sentences(text.strip()))
-        log("  ---- 通知接话 #%d(%s 提到你) ----\n%s\n  ----------------"
-            % (tid, from_user, text))
+            # LLM 临时故障(限速/无渠道)不该消费掉通知:不标记,留待下轮重试;
+            # 连续 3 次都失败才标记放弃,防止接口长期宕机时空转
+            n_fail = self.notif_llm_fail.get(rid, 0) + 1
+            self.notif_llm_fail[rid] = n_fail
+            if n_fail >= 3:
+                self.store.save_notif(rid, tid, from_user, n["kind"],
+                                      "fail:LLM x3 %s" % (err or "空"))
+                self.notif_llm_fail.pop(rid, None)
+                log("  通知接话放弃 #%d:LLM 连续 3 次失败" % tid, "WARN")
+            else:
+                log("  通知接话:LLM 暂不可用(第 %d 次),下轮重试 #%d" % (n_fail, tid), "WARN")
+            return False
+        text = "%s %s" % (mention, self._drop_question_sentences(text.strip()))
+        log("  ---- 通知接话 #%d(%s 在 %s 提到你) ----\n%s\n  ----------------"
+            % (tid, from_user, ("#%d 楼" % floor) if floor else "主题", text))
 
         if self.dry:
             self.store.save_notif(rid, tid, from_user, n["kind"], "ok(dry)")
