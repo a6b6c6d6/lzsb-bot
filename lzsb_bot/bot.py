@@ -362,6 +362,11 @@ class Bot:
             if kind not in ("提及", "回复"):
                 self.store.save_notif(rid, tid, from_user, kind, "skip:类型")
                 continue
+            if not n.get("mentioned"):
+                # 「一定要检测到@才回复」:通知内容里没有真的 @ bot 就不插嘴
+                # (有人在帖子里回复其他人也会产生通知,不能去接话)
+                self.store.save_notif(rid, tid, from_user, kind, "skip:无@提及")
+                continue
             if from_user == bot_name:
                 self.store.save_notif(rid, tid, from_user, kind, "skip:自己")
                 continue

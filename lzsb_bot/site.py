@@ -445,6 +445,8 @@ class LsbSite:
         uid = self.get_own_uid()
         if not uid:
             return []
+        bot_name = (self.cfg.get("bot_username") or "").strip()
+        bot_uid = str(uid)
         out = []
         for p in range(1, max(1, pages) + 1):
             url = "%s/user/%d?tab=notifications" % (self.base, uid)
@@ -466,9 +468,16 @@ class LsbSite:
                 if not (au and km and lm):
                     continue
                 cm = re.search(r'nb-editor-post-content">(.*?)</p>', seg, re.S)
-                text = div_to_text(cm.group(1)) if cm else ""
+                raw_text = div_to_text(cm.group(1)) if cm else ""
+                # @-mention 检测必须用原文:通知页的 kind 标签不可靠,
+                # 有些「提及」实际上没有 @ 到 bot(比如单纯回复了别人)
+                mentioned = False
+                if bot_name and ('@' + bot_name) in raw_text:
+                    mentioned = True
+                if bot_uid and ('@' + bot_uid) in raw_text:
+                    mentioned = True      # 用 uid @ 的也算(jp430 的 @27718)
                 # 去掉「在主题《…》中提到你：@我」前缀,只留对方说的话
-                text = re.sub(r"^.*?(?:提到你|回复了[你您])[:：]", "", text)
+                text = re.sub(r"^.*?(?:提到你|回复了[你您])[:：]", "", raw_text)
                 text = re.sub(r"^@\S+\s*", "", text).strip()
                 out.append({
                     "kind": html_unescape(km.group(1)).strip(),
@@ -478,6 +487,7 @@ class LsbSite:
                     "rid": int(lm.group(2)),
                     "title": html_unescape(strip_tags(lm.group(3))).strip(),
                     "text": text,
+                    "mentioned": mentioned,
                     "time_text": html_unescape(strip_tags(
                         re.search(r'<div class="post-meta">(.*?)</div>', seg,
                                   re.S).group(1))) if 'post-meta' in seg else "",
@@ -488,16 +498,13 @@ class LsbSite:
         return out
 
     def locate_floor(self, tid, rid, max_pages=10):
-        """定位回复 rid 在帖子中的楼层号,返回 (楼层号, 该楼文本) 或 (None, None)。
+        """定位回复 rid 的楼层号,返回 (楼层号, 该楼文本) 或 (None, None)。
 
-        站点楼层约定(实测 21517 / 21531 确认):
-          - 楼层号**不含楼主**:第一条回复 = #1,楼主不占楼层号
-          - 回复正文里自动插入的「@作者 #N」的 N 指的是**被回复的目标楼层**,
-            不是回复者自己所在的楼层 —— 所以绝不能用通知摘要里的 #N 当自己的楼层
-        每页约 50 层,逐页扫描直到找到 pid==rid;找不到(被审核隐藏/已删除/
-        超过页数上限)返回 (None, None),调用方应退化为纯 @ 提及(不盖楼)。
+        楼层号**直接读站点渲染在 DOM 上的 data-floor 属性** —— 帖子存在
+        嵌套渲染/删楼时,DOM 顺序与楼层号不一致,按位置数必然错位
+        (实测 21598 踩坑:数位置算出 #21,站点真实楼层是 #26)。
+        每页约 50 层,逐页扫描直到找到;找不到返回 (None, None)。
         """
-        counter = 0
         seen = set()
         for page in range(1, max(1, max_pages) + 1):
             url = "%s/topic/%d" % (self.base, tid)
@@ -506,28 +513,23 @@ class LsbSite:
             code, html, _ = self.http.get(url)
             if code != 200:
                 break
-            posts = parse_posts(html)
-            if not posts:
+            floors = {}
+            for m in re.finditer(
+                    r'<li[^>]*\bid="post-(\d+)"[^>]*\bdata-floor="(\d+)"', html):
+                floors[m.group(1)] = int(m.group(2))
+            if not floors:
                 break
-            # 超页时站点会回退渲染第一页(首项=楼主),据此判定到头了
-            if page > 1 and posts[0]["pid"] == str(tid):
-                break
-            new_found = False
-            for i, p in enumerate(posts):
-                if p["pid"] in seen:
-                    continue
-                seen.add(p["pid"])
-                new_found = True
-                if page == 1 and i == 0:
-                    continue            # 楼主不占楼层号
-                counter += 1
-                if str(p["pid"]) == str(rid):
-                    return counter, p["content"]
-            if not new_found:
-                break
+            new = [pid for pid in floors if pid not in seen]
+            if page > 1 and not new:
+                break                       # 超页回退渲染,没有新内容了
+            seen.update(floors)
+            if str(rid) in floors:
+                posts = {p["pid"]: p["content"] for p in parse_posts(html)}
+                return floors[str(rid)], posts.get(str(rid), "")
         return None, None
 
-    # ==================================================================
+
+# ==================================================================
     # 私信
     # ==================================================================
 
