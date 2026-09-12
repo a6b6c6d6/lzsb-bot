@@ -40,6 +40,8 @@ class Bot:
         self.fail_count = {}          # tid -> 已失败次数(仅内存,重启清零)
         self.notif_fail = {}          # rid -> 通知对应帖子打不开的次数(仅内存)
         self.notif_llm_fail = {}      # rid -> LLM 连续失败次数(仅内存)
+        self.notif_submit_fail = {}   # rid -> 提交时会话失效的次数(仅内存)
+        self.last_relogin = 0.0       # 上次强制重登的时间戳(10 分钟内最多一次)
         self.system_prompt = cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
 
     # ------------------------------------------------------------------
@@ -47,6 +49,23 @@ class Bot:
     def stop(self, *_):
         self.running = False
         log("收到停止信号,正在退出……", "WARN")
+
+    def _maybe_relogin(self, reason):
+        """会话失效的兜底。
+
+        check_login() 只验证 cookie 存在;cookie 被服务端过期/踢掉时察觉不到,
+        bot 会进入「假运行」——每轮都在但什么都发不出去。靠发帖/接话时的
+        「未登录」症状在这里强制重登,10 分钟内最多一次,避免触发登录风控。
+        """
+        if time.time() - self.last_relogin < 600:
+            return False
+        self.last_relogin = time.time()
+        log("  检测到会话失效(%s),尝试重新登录……" % reason, "WARN")
+        try:
+            return self.site.login()
+        except Exception as e:
+            log("  重新登录失败: %s" % e, "ERROR")
+            return False
 
     def sleep(self, seconds):
         """可被 Ctrl+C 提前打断的睡眠。"""
@@ -325,6 +344,20 @@ class Bot:
             time.sleep(1)
 
         ok, msg = self.site.submit_reply(tid, text)
+        if not ok and ("未登录" in (msg or "") or "ajax-reply-form" in (msg or "")):
+            # 会话失效:不消费通知,强制重登,下轮重试;连续 3 次才放弃
+            n_fail = self.notif_submit_fail.get(rid, 0) + 1
+            self.notif_submit_fail[rid] = n_fail
+            self._maybe_relogin("接话提交会话失效")
+            if n_fail >= 3:
+                self.store.save_notif(rid, tid, from_user, n["kind"],
+                                      "fail:x3 会话失效 %s" % msg)
+                self.notif_submit_fail.pop(rid, None)
+                log("  通知接话放弃 #%d:会话失效连续 3 次" % tid, "ERROR")
+            else:
+                log("  提交失败(%s),重登后下轮重试(第 %d 次)" % (msg, n_fail), "WARN")
+            return True
+        self.notif_submit_fail.pop(rid, None)
         self.store.save_notif(rid, tid, from_user, n["kind"],
                               "ok" if ok else "fail:%s" % msg)
         if ok:
@@ -391,6 +424,11 @@ class Bot:
         ok, reason = should_reply(self.cfg, topic, self.store)
         if not ok:
             log("  跳过 #%d 「%s」 — %s" % (tid, topic.get("title", "")[:40], reason))
+            if "未登录" in reason:
+                # 会话可能已被服务端踢掉:强制重登,并把该帖撤销「已见」,
+                # 重登成功后下轮重试(10 分钟内最多重登一次,不受控时保持跳过)
+                if self._maybe_relogin(reason):
+                    self.store.unmark_seen(tid)
             return
 
         log("  生成回复: #%d 「%s」(%s) 楼主发言 %d 条"
