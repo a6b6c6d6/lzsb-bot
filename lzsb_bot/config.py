@@ -64,6 +64,9 @@ DEFAULTS = {
     "donate_enabled": True,
     "donate_amount": 1,
 
+    # ---- 跨端同步 ----
+    "sync_replies_pages": 2,
+
     # ---- 联网搜索 ----
     "enable_search": True,
     "search_mode": SEARCH_MODE_SMART,

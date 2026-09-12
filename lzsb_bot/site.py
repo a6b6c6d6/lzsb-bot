@@ -381,6 +381,50 @@ class LsbSite:
         return False, msg
 
     # ==================================================================
+    # 个人主页回复(跨端同步用)
+    # ==================================================================
+
+    def get_own_uid(self):
+        """推断自己的 uid:bbs_auth cookie 首段就是 uid(如 27718.xxx)。"""
+        c = self.http.get_cookie("bbs_auth") or ""
+        head = c.split(".")[0]
+        return int(head) if head.isdigit() else None
+
+    def fetch_user_replies(self, uid, pages=2):
+        """拉个人主页「回复」标签页,返回 [(tid, replyid, title, excerpt), ...]。
+
+        页面是**公开的**(无需登录),结构实测(2026-09-12):
+            <ul class="post-list">
+              <li class="post-item">
+                <a class="post-title" href="/topic/21560?replyid=178140">标题</a>
+                <div class="profile-reply-excerpt">回复摘要…</div>
+        按时间倒序,最近的在最前。用于跨端同步:新设备的空 state.db 启动时
+        把站点上已有的 bot 回复标记进本地,避免两端重复回帖。
+        """
+        out = []
+        for p in range(1, max(1, pages) + 1):
+            url = "%s/user/%d?tab=replies" % (self.base, uid)
+            if p > 1:
+                url += "&page=%d" % p
+            code, html, _ = self.http.get(url)
+            if code != 200:
+                break
+            found = 0
+            for m in re.finditer(
+                    r'<a class="post-title" href="/topic/(\d+)\?replyid=(\d+)"[^>]*>'
+                    r'(.*?)</a>', html, re.S):
+                tid, rid = int(m.group(1)), m.group(2)
+                title = html_unescape(strip_tags(m.group(3))).strip()
+                em = re.search(r'profile-reply-excerpt[^>]*>(.*?)</div>',
+                               html[m.end():m.end() + 800], re.S)
+                excerpt = div_to_text(em.group(1))[:120] if em else ""
+                out.append((tid, rid, title, excerpt))
+                found += 1
+            if not found:
+                break                      # 翻页翻空了
+        return out
+
+    # ==================================================================
     # 打赏(点赞 + 积分)
     # ==================================================================
 

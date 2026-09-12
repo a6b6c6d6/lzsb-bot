@@ -151,6 +151,44 @@ class Bot:
             log("  打赏 #%d 异常: %s" % (topic["tid"], e), "WARN")
 
     # ------------------------------------------------------------------
+    # 跨端同步(个人主页回复)
+    # ------------------------------------------------------------------
+
+    def _sync_replies_from_profile(self):
+        """从个人主页「回复」标签页同步站点上的已有回复到本地库。
+
+        解决跨端问题:手机和电脑各有一份 state.db 互不同步。新设备启动时
+        本地没有历史回复记录,靠它把站点上的真实回复拉下来标记好,
+        一开机就和另一端对齐(页面对是公开的,不依赖登录态)。
+        与 filters 里的「楼层作者检查」互为双保险:后者是逐帖精确判断,
+        这里是启动时批量对账。
+        """
+        pages = int(self.cfg.get("sync_replies_pages", 2) or 0)
+        if pages <= 0:
+            return
+        uid = self.site.get_own_uid()
+        if not uid:
+            log("跨端同步跳过:无法确定自己的 uid", "WARN")
+            return
+        try:
+            items = self.site.fetch_user_replies(uid, pages)
+        except Exception as e:
+            log("跨端同步失败(忽略): %s" % e, "WARN")
+            return
+        if not items:
+            log("跨端同步:站点上没有拉到回复(新号或页面结构变化)")
+            return
+        new_marked = 0
+        for tid, _rid, title, _ex in items:
+            if not self.store.has_replied(tid):
+                # title/正文留空:同步记录只用于去重判断,不参与其他逻辑
+                self.store.save_reply(tid, title, "", "ok(站点同步)")
+                new_marked += 1
+            self.store.mark_seen(tid, "", title)
+        log("跨端同步:站点最近 %d 条回复已对账(本地新增标记 %d 条)"
+            % (len(items), new_marked))
+
+    # ------------------------------------------------------------------
     # 单轮
     # ------------------------------------------------------------------
 
@@ -320,6 +358,7 @@ class Bot:
             fail = 0
 
             if not bootstrapped:
+                self._sync_replies_from_profile()
                 if self.store.is_empty():
                     self.bootstrap()
                 bootstrapped = True
