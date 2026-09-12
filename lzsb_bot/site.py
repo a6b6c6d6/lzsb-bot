@@ -528,6 +528,57 @@ class LsbSite:
         return None, None
 
     # ==================================================================
+    # 私信
+    # ==================================================================
+
+    def send_dm(self, partner_uid, content):
+        """给指定用户发一条私信(纯文本,最长 500 字)。返回 (ok, message)。
+
+        流程:GET /direct_messages/{uid} 会话页解析 compose 表单
+            (class="direct-messages-compose",含 _csrf + partner_id)
+            → POST /direct_messages/{uid} (multipart,与浏览器一致)
+        """
+        url = "%s/direct_messages/%d" % (self.base, int(partner_uid))
+        code, html, _ = self.http.get(url)
+        if code != 200:
+            return False, "私信页打开失败 code=%s" % code
+
+        m = re.search(r'<form class="direct-messages-compose"[^>]*>(.*?)</form>',
+                      html, re.S)
+        if not m:
+            return False, "未找到私信表单(可能未登录/被拉黑)"
+        seg = m.group(1)
+        cm = re.search(r'name="_csrf"[^>]*value="([^"]*)"', seg)
+        pm = re.search(r'name="partner_id"[^>]*value="([^"]*)"', seg)
+        if not (cm and pm):
+            return False, "私信表单字段不全"
+
+        content = (content or "").strip()[:500]
+        if not content:
+            return False, "内容为空"
+
+        code, body, _ = self.http.post_multipart(
+            url, [("_csrf", html_unescape(cm.group(1))),
+                  ("partner_id", html_unescape(pm.group(1))),
+                  ("content", content)],
+            extra_headers={"Origin": self.base, "X-Requested-With": "XMLHttpRequest"},
+            referer=url)
+        if code == 0:
+            return False, "请求失败: %s" % body
+
+        try:
+            j = json.loads(body)
+            if j.get("ok") or j.get("success"):
+                return True, j.get("message") or j.get("tip") or "私信已发送"
+            if j.get("message") or j.get("tip"):
+                return False, j.get("message") or j.get("tip")
+        except (ValueError, TypeError):
+            pass
+        if code in (200, 302):
+            return True, "私信已发送"
+        return False, "返回异常 code=%s: %s" % (code, strip_tags(body)[:150])
+
+    # ==================================================================
     # 打赏(点赞 + 积分)
     # ==================================================================
 

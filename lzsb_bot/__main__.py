@@ -55,11 +55,29 @@ def main(argv=None):
     ap.add_argument("--topk", type=int, default=None, help="配合 --search:结果条数")
     ap.add_argument("--proxy", default=None, help="覆盖 config 里的代理")
     ap.add_argument("--config", default=None, help="指定配置文件路径")
+    ap.add_argument("--dm", nargs=2, metavar=("UID", "内容"),
+                    help="给指定 uid 发一条私信后退出(最长 500 字)")
     args = ap.parse_args(argv)
 
     # --search 不需要 config,允许在没有 config.json 时先验证搜索链路
     if args.search:
         return _cmd_search(args)
+
+    # --dm:发一条私信就退出
+    if args.dm:
+        if not ensure_config():
+            return 1
+        cfg = load_config(args.config)
+        if not cfg:
+            return 1
+        site = LsbSite(cfg)
+        if not site.login():
+            log("登录失败,无法发私信", "ERROR")
+            return 3
+        ok, msg = site.send_dm(int(args.dm[0]), args.dm[1])
+        log("%s (发给 uid=%s:%s)" % (msg, args.dm[0],
+                                     (args.dm[1] or "")[:40]))
+        return 0 if ok else 4
 
     if not ensure_config():
         log("没有 config.json 也没有 config.example.json,无法启动", "ERROR")
