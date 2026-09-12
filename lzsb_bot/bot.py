@@ -509,6 +509,8 @@ class Bot:
                 % int(cfg.get("notify_max_per_tick", 2) or 0))
         else:
             log("  通知接话  : 关闭")
+        if cfg.get("passive_mode"):
+            log("  回复模式  : 被动(不主动回新帖,只在被 @ 时回应)")
         log("  AI 接口   : %s" % ", ".join(
             p.get("name") or p.get("model") or "?"
             for p in (cfg.get("llm", {}).get("providers") or [])[:4]))
@@ -553,8 +555,12 @@ class Bot:
                 bootstrapped = True
 
             try:
-                self.tick()
-                self._handle_notifications()
+                if self.cfg.get("passive_mode"):
+                    # 被动模式:不主动回新帖,只在被 @ 时回应
+                    self._handle_notifications()
+                else:
+                    self.tick()
+                    self._handle_notifications()
             except Exception as e:
                 log("本轮异常: %s: %s" % (type(e).__name__, e), "ERROR")
 

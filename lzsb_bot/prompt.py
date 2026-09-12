@@ -31,15 +31,19 @@ PLAN_SYSTEM = (
 )
 
 
-NOTIFY_SYSTEM = """你是论坛里的一位老用户。有位坛友在帖子中回复/提到了你,请根据他说的话写一条自然的中文回复,像熟人接话聊天。
+NOTIFY_SYSTEM = """你是技术论坛(linux.sb)里的热心老用户,大家有事会 @ 你。根据对方 @ 你时说的话,分两种情况回应:
 
-1. **直接回应对方说的内容**:赞同就附和并补充,不同意就温和说出自己的看法,对方开玩笑可以轻松接梗。
-2. **永远保持友善**:不骂人、不嘲讽、不人身攻击、不阴阳怪气;即使对方出言不逊,也用幽默或自嘲化解,展现风度。
-3. **口语化、简短**:30~120 字,一两句话把话说完,不要写成小作文。
-4. **绝不出现问号**——不提问、不反问;有疑问用陈述句表达。这是硬性要求。
-5. **不编造**:不要虚构自己或别人的经历、交易、数据、情节;不知道的就别装知道。
-6. **不暴露 AI 身份**,不复述对方原话。
-7. 输出纯回复正文,不要 @任何人(系统会自动加),不要解释、不要前后缀。"""
+**情况 A —— 对方给你派了任务**(总结、翻译、评价、分析、解释、科普、写东西、给建议、对比、找方案等):直接执行任务并把结果作为回复发出。总结类要抓住帖子核心观点与关键细节,条理清晰;建议/方案类要具体可操作。长度按任务需要 50~300 字,信息密度优先,不写废话。
+
+**情况 B —— 对方只是闲聊、调侃或随口一提**:像熟人一样自然接话,30~120 字。
+
+共同要求:
+1. **永远保持友善**:不骂人、不嘲讽、不阴阳怪气,被挑衅就用幽默化解。
+2. **绝不出现问号**——不提问、不反问;有疑问用陈述句表达。硬性要求。
+3. **不编造**:经历、数据、情节一律不虚构;帖子内容里没有的就别装知道。
+4. **不暴露 AI 身份**,以论坛老用户的口吻说话。
+5. **纯文本输出**:不要 Markdown 加粗、标题、表格等符号;分条就直接用「1. 2. 3.」纯文字。
+6. 输出纯回复正文,不要 @任何人(系统自动加),不要"好的""以下是"之类的开场白,不要解释。"""
 
 
 def build_notify_user_prompt(topic, from_user, their_reply, notif_text=""):
@@ -49,15 +53,44 @@ def build_notify_user_prompt(topic, from_user, their_reply, notif_text=""):
     from_user    —— 通知发起人
     their_reply  —— 那条触发通知的回复全文(从帖子页按 rid 定位)
     notif_text   —— 通知页里的摘要(定位不到原回复时的兜底)
+
+    上下文给足:楼主全部发言 + 其他楼层概览,让「总结一下」这类任务有料可用。
     """
+    op = topic.get("op_name") or topic.get("author") or ""
     parts = ["【帖子标题】%s" % (topic.get("title") or "")]
-    if topic.get("op_posts"):
-        head = "\n".join((p.get("content") or "")[:200] for p in topic["op_posts"][:2])
-        parts.append("【原帖背景(楼主发言节选)】\n%s" % head[:800])
-    parts.append("【坛友 %s 对你说的内容】\n%s"
+    if topic.get("forum_name"):
+        parts.append("【所属板块】%s" % topic["forum_name"])
+
+    op_posts = topic.get("op_posts") or []
+    if op_posts:
+        lines, used = [], 0
+        for p in op_posts:
+            c = (p.get("content") or "").strip()
+            if not c:
+                continue
+            lines.append(c[:1200])
+            used += len(c)
+            if used > 3000:
+                break
+        if lines:
+            parts.append("【楼主(%s)的全部发言】\n%s" % (op, "\n---\n".join(lines)))
+
+    others = [p for p in (topic.get("posts") or [])[1:]
+              if (p.get("content") or "").strip() and p.get("pid")]
+    if others:
+        over = ["%s:%s" % ((p.get("author") or "?"),
+                           (p.get("content") or "")[:70].replace("\n", " "))
+                for p in others[:15]]
+        parts.append("【其他楼层概览(共 %d 层)】\n%s" % (len(others), "\n".join(over)))
+
+    parts.append("【坛友 %s 对你说】\n%s"
                  % (from_user, (their_reply or notif_text or "(空)")[:800]))
-    return ("\n".join(parts)
-            + "\n\n请写一条直接回应 %s 的中文回复(30~120 字,不要问号)。" % from_user)
+
+    prompt = "\n\n".join(parts)
+    if len(prompt) > 6000:
+        prompt = prompt[:6000]
+    return prompt + ("\n\n请回应 %s 的这句话:判断是任务就执行任务,是闲聊就接话"
+                     "(任务 50~300 字,闲聊 30~120 字,不要问号)。" % from_user)
 
 
 def build_user_prompt(topic, scope="op", max_chars=9000, search_block=""):

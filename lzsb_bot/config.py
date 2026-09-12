@@ -71,6 +71,7 @@ DEFAULTS = {
     # ---- 通知接话(有人回复/提及 bot 时去接话) ----
     "notify_reply_enabled": True,
     "notify_max_per_tick": 2,
+    "passive_mode": False,
 
     # ---- 联网搜索 ----
     "enable_search": True,
