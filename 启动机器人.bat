@@ -20,7 +20,16 @@ if not defined PY (
 if not exist "config.json" (
   echo [提示] 还没有 config.json，正在从 config.example.json 复制一份……
   copy /y "config.example.json" "config.json" >nul
-  echo        请用记事本打开 config.json，填好账号密码和 AI 接口后再运行。
+  echo        请用记事本打开 config.json，填好账号密码后再运行。
+  echo.
+  pause
+  exit /b 1
+)
+
+if not exist "llm.json" (
+  echo [提示] 还没有 llm.json，正在从 llm.example.json 复制一份……
+  copy /y "llm.example.json" "llm.json" >nul
+  echo        请用记事本打开 llm.json，填好 AI 接口（base_url / api_key / model）后再运行。
   echo.
   pause
   exit /b 1
@@ -28,11 +37,12 @@ if not exist "config.json" (
 
 echo ==================================================
 echo   linux.sb 自动回帖机器人
+echo   配置文件: config.json（站点/搜索） + llm.json（AI 接口）
 echo   按 Ctrl+C 可随时安全停止
 echo ==================================================
 echo.
 
-"%PY%" bot.py
+"%PY%" -m lzsb_bot
 
 echo.
 echo 机器人已退出。

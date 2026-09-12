@@ -7,7 +7,8 @@
 #
 # 首次部署:
 #   pkg update && pkg install python nodejs tmux
-#   (若从 Windows 拷过来,先修正换行符: sed -i 's/\r$//' start.sh bot.py cap_solver.py web_search.py)
+#   (若从 Windows 拷过来,先修正换行符:
+#    sed -i 's/\r$//' start.sh bot.py $(find lzsb_bot -name '*.py'))
 
 cd "$(dirname "$0")" || exit 1
 
@@ -25,7 +26,14 @@ fi
 if [ ! -f config.json ]; then
   echo "[提示] 还没有 config.json,正在从 config.example.json 复制……"
   cp config.example.json config.json
-  echo "       请编辑 config.json,填好账号密码和 AI 接口后再运行。"
+  echo "       请编辑 config.json,填好账号密码后再运行。"
+  exit 1
+fi
+
+if [ ! -f llm.json ]; then
+  echo "[提示] 还没有 llm.json,正在从 llm.example.json 复制……"
+  cp llm.example.json llm.json
+  echo "       请编辑 llm.json,填好 AI 接口(base_url / api_key / model)后再运行。"
   exit 1
 fi
 
@@ -37,12 +45,13 @@ fi
 
 echo "=================================================="
 echo "  linux.sb 自动回帖机器人 (Termux)"
+echo "  配置文件: config.json(站点/搜索) + llm.json(AI 接口)"
 echo "  提醒: Clash 代理必须保持开启"
 echo "  按 Ctrl+C 可随时停止"
 echo "=================================================="
 echo
 
-python bot.py
+python -m lzsb_bot
 
 if command -v termux-wake-unlock >/dev/null 2>&1; then
   termux-wake-unlock

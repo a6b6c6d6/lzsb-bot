@@ -1,5 +1,6 @@
 {
   "_说明": "复制本文件为 config.json 后填写。config.json 已在 .gitignore 中,不会进仓库。",
+  "_用法": "python -m lzsb_bot   (旧的 python bot.py 仍可用)",
 
   "base_url": "https://linux.sb",
   "proxy": "http://127.0.0.1:7897",
@@ -10,13 +11,19 @@
   "password": "",
   "_cookie说明": "可选。留空则用上面的账号密码自动登录并自动续期;若填了 Cookie 串则优先使用它。",
   "cookie": "",
+  "_bot_username说明": "本 bot 的显示名。用于跨端去重:抓到的帖子里若已出现该名字的发言就跳过。留空则取 username。",
+  "bot_username": "",
 
   "poll_interval": 60,
-  "reply_delay_min": 30,
-  "reply_delay_max": 180,
+  "_reply_delay说明": "检测到新帖后随机等待的秒数区间,降低机器味",
+  "reply_delay_min": 10,
+  "reply_delay_max": 30,
   "daily_limit": 20,
 
   "_板块": "1 错误地方 / 2 福利放送 / 3 资源分享 / 4 技术交流 / 5 求助问答 / 6 社区治理 / 8 我要推广 / 9 社区公告 / 10 大禹治水",
+  "_scan_forums说明": "只在哪些板块里找新帖",
+  "scan_forums": [1, 3, 4, 5, 6, 9, 10],
+  "scan_pages": 1,
   "deny_forums": [2, 8],
   "allow_forums": [],
 
@@ -27,47 +34,33 @@
   "deny_keywords": [
     "发卡", "发卡贴", "兑换", "卡密", "卡号", "抽奖", "盖楼", "领取",
     "免费额度", "送额度", "测试额度", "体验额度", "已结束", "已蹬完", "速蹬",
-    "白嫖", "公益站", "中转站", "推广", "邀请码", "订阅", "试用"
+    "白嫖", "公益站", "推广", "邀请码"
   ],
+
+  "_安全阀说明": "防挖坟。单轮出现超过 bootstrap_threshold 个未见过帖子 → 判定为首次运行/长期停摆,只标记不回复;单轮最多处理 max_per_tick 个",
+  "bootstrap_threshold": 20,
+  "max_per_tick": 5,
+  "max_topic_age_minutes": 1440,
 
   "system_prompt": "",
 
   "_context_scope说明": "op = 用『楼主在本帖的全部发言』作上下文(默认);first = 只用首楼正文",
   "context_scope": "op",
 
-  "_搜索说明": "回复前先联网搜一下,把结果作为背景资料喂给 AI,让回帖有帖子之外的信息量",
+  "_联网搜索说明": "enable_search = 是否联网(默认开);搜索前先用 AI 提炼关键词,把结果作为背景资料喂给模型",
   "enable_search": true,
+  "_search_mode说明": "联网搜索模式,填 1 / 2 / 3 即可。1 = 智能路由(中英分流·多主源并行,默认);2 = 多源聚合(只打官方 JSON/RSS 接口,无反爬无广告);3 = Bing 单源直连(通用兜底,结果偏杂)",
+  "search_mode": 1,
   "search_topk": 5,
   "search_timeout": 12,
-  "search_sources": ["google_news", "bing", "hn"],
   "_search_proxy说明": "留空 = 用上面的 proxy;搜索引擎基本都需要代理才能访问",
   "search_proxy": "",
+  "_search_sources说明": "高级用法:显式指定来源列表来覆盖 search_mode。可选 google_news / bing / hn / stackoverflow / github。留空或不写则按 search_mode 走。",
+  "search_sources": [],
 
   "_dry_run说明": "true = 只生成不提交,用来观察输出质量;确认满意后再改成 false",
   "dry_run": true,
 
-  "_llm说明": "providers 按顺序尝试,前一个限速/5xx/返回空内容时自动切下一个;可放多个中转站互为备份",
-  "llm": {
-    "providers": [
-      {
-        "name": "主接口",
-        "base_url": "https://你的中转站/v1",
-        "api_key": "sk-xxxxxx",
-        "model": "deepseek-v4-flash"
-      },
-      {
-        "name": "备用接口",
-        "base_url": "https://备用中转站/v1",
-        "api_key": "sk-yyyyyy",
-        "model": "ministral-3"
-      }
-    ],
-    "temperature": 0.8,
-    "max_tokens": 2400,
-    "timeout": 180,
-    "max_retry": 2
-  },
-
-  "_llm_proxy说明": "留空表示与上面的 proxy 相同;若中转站需要不同出口可单独指定",
-  "llm_proxy": ""
+  "_AI接口说明": "★ AI 接口配置已独立到 llm.json(复制 llm.example.json 得到)。若项目根目录存在 llm.json,则优先用它;下面的 llm 段只在没有 llm.json 时生效。",
+  "llm": {}
 }
