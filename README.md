@@ -50,7 +50,7 @@ python -m lzsb_bot --search 关键词 [--mode 1|2|3]   只测联网搜索
 | `bot_username` | bot 的显示名,用于跨端去重(手机/电脑同时跑不会重复回帖)。留空取 `username` |
 | `poll_interval` | 轮询间隔,秒,默认 60 |
 | `reply_delay_min/max` | 检测到新帖后随机等待的秒数,降低机器味 |
-| `daily_limit` | 每日最多回复条数,默认 20 |
+| `daily_limit` | 每日最多回复条数,默认 100 |
 | `deny_forums` | 不回复的板块,默认 `[2, 8]`(福利放送、我要推广) |
 | `deny_keywords` | 标题命中即跳过,滤掉发卡/赠送/兑换类帖 |
 | `skip_gacha` | 站点给发卡贴打了自带标记,`true` = 一律不回(推荐) |

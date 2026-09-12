@@ -45,7 +45,7 @@ DEFAULTS = {
     "poll_interval": 60,
     "reply_delay_min": 10,
     "reply_delay_max": 30,
-    "daily_limit": 20,
+    "daily_limit": 100,
 
     "scan_forums": [1, 3, 4, 5, 6, 9, 10],
     "scan_pages": 1,
