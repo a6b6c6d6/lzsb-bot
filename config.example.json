@@ -47,6 +47,10 @@
   "_context_scope说明": "op = 用『楼主在本帖的全部发言』作上下文(默认);first = 只用首楼正文",
   "context_scope": "op",
 
+  "_打赏说明": "回帖成功后自动给该帖楼主打赏(同时完成点赞)。donate_enabled = 是否开启;donate_amount = 每次打赏积分数,站方限 1~99;余额不足/已打赏过会跳过并记日志,不影响回帖",
+  "donate_enabled": true,
+  "donate_amount": 1,
+
   "_联网搜索说明": "enable_search = 是否联网(默认开);搜索前先用 AI 提炼关键词,把结果作为背景资料喂给模型",
   "enable_search": true,
   "_search_mode说明": "联网搜索模式,填 1 / 2 / 3 即可。1 = 智能路由(中英分流·多主源并行,默认);2 = 多源聚合(只打官方 JSON/RSS 接口,无反爬无广告);3 = Bing 单源直连(通用兜底,结果偏杂)",

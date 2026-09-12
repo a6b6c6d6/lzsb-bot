@@ -60,6 +60,10 @@ DEFAULTS = {
     "context_scope": "op",
     "system_prompt": "",
 
+    # ---- 打赏 ----
+    "donate_enabled": True,
+    "donate_amount": 1,
+
     # ---- 联网搜索 ----
     "enable_search": True,
     "search_mode": SEARCH_MODE_SMART,

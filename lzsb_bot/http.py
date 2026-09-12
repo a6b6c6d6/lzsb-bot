@@ -8,6 +8,7 @@
 
 import gzip
 import http.cookiejar
+import random
 import time
 import urllib.error
 import urllib.parse
@@ -97,6 +98,68 @@ class HttpClient:
 
     def post(self, url, data, **kw):
         return self.request("POST", url, data=data, **kw)
+
+    def post_multipart(self, url, fields, extra_headers=None, referer=None):
+        """以 multipart/form-data 提交(与浏览器原生表单一致)。
+
+        fields: [(name, value), ...] 按顺序编码。
+        返回 (status_code, text, final_url),语义同 request()。
+        """
+        boundary = "----geckoformboundary%s0123456789abcdef" % format(
+            random.getrandbits(96), "032x")
+        crlf = "\r\n"
+        body = b""
+        for name, value in fields:
+            body += (crlf + "--" + boundary + crlf
+                     + 'Content-Disposition: form-data; name="%s"' % name
+                     + crlf + crlf + str(value)).encode("utf-8")
+        body += (crlf + "--" + boundary + "--" + crlf).encode("utf-8")
+
+        headers = {
+            "User-Agent": self.ua,
+            "Content-Type": "multipart/form-data; boundary=" + boundary,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "close",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        if referer and "Referer" not in headers:
+            headers["Referer"] = referer
+
+        last_err = ""
+        for attempt in range(self.retry + 1):
+            req = urllib.request.Request(url, data=body, headers=headers,
+                                         method="POST")
+            try:
+                resp = self.opener.open(req, timeout=self.timeout)
+                raw = resp.read()
+                if resp.headers.get("Content-Encoding") == "gzip":
+                    try:
+                        raw = gzip.decompress(raw)
+                    except OSError:
+                        pass
+                return resp.getcode(), raw.decode("utf-8", "replace"), resp.geturl()
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    if e.headers.get("Content-Encoding") == "gzip":
+                        raw = gzip.decompress(raw)
+                except OSError:
+                    pass
+                text = raw.decode("utf-8", "replace")
+                if e.code >= 500 and attempt < self.retry:
+                    last_err = "HTTP %s" % e.code
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return e.code, text, url
+            except Exception as e:
+                last_err = "%s: %s" % (type(e).__name__, e)
+                if attempt < self.retry:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break
+        return 0, "", last_err
 
     def get_cookie(self, name):
         for c in self.jar:

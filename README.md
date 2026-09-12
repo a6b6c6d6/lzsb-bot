@@ -55,6 +55,8 @@ python -m lzsb_bot --search 关键词 [--mode 1|2|3]   只测联网搜索
 | `deny_keywords` | 标题命中即跳过,滤掉发卡/赠送/兑换类帖 |
 | `skip_gacha` | 站点给发卡贴打了自带标记,`true` = 一律不回(推荐) |
 | `context_scope` | `op` = 用楼主在本帖的全部发言做上下文(默认);`first` = 只用首楼 |
+| `donate_enabled` | 回帖成功后是否自动给楼主打赏(同时点赞),默认开 |
+| `donate_amount` | 每次打赏积分数,站方限 1~99,默认 1。账号注册需满 3 天才能打赏 |
 | `bootstrap_threshold` | 防挖坟安全阀:单轮未见过帖超过该数 → 判定首次运行/长期停摆,只标记不回复 |
 | `max_per_tick` | 防爆量安全阀:单轮最多处理 N 个新帖 |
 | `dry_run` | `true` = 只生成不提交 |

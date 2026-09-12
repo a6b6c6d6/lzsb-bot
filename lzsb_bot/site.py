@@ -380,6 +380,83 @@ class LsbSite:
                 time.sleep(2 * attempt)
         return False, msg
 
+    # ==================================================================
+    # 打赏(点赞 + 积分)
+    # ==================================================================
+
+    def parse_donate_form(self, html):
+        """从打赏弹层页解析 POST /donate 所需的全部字段。
+
+        表单实测结构(2026-09-12):
+            <form method="post" action="/donate" data-donate-form data-no-ajax="1">
+              <input type="hidden" name="_csrf" value="...">
+              <input type="hidden" name="topic_id" value="...">
+              <input type="hidden" name="request_key" value="...">
+              <input type="number" name="amount" min="1" max="99"
+                     placeholder="不填写则只点赞">
+        request_key 每次打开页面都变,必须现取。
+        """
+        m = re.search(r'<form method="post" action="/donate"[^>]*>(.*?)</form>',
+                      html, re.S)
+        if not m:
+            return None
+        seg = m.group(1)
+        out = {}
+        for name in ("_csrf", "topic_id", "request_key"):
+            fm = re.search(r'name="%s"[^>]*value="([^"]*)"' % name, seg)
+            if not fm:
+                fm = re.search(r'value="([^"]*)"[^>]*name="%s"' % name, seg)
+            out[name] = html_unescape(fm.group(1)) if fm else ""
+        if not (out["_csrf"] and out["request_key"]):
+            return None
+        return out
+
+    def donate_topic(self, tid, amount=1):
+        """给帖子打赏 amount 积分(同时完成点赞)。
+
+        流程:GET /donate?topic_id=N 拿弹层表单(含一次性 request_key)
+             → POST /donate (multipart,与浏览器一致)
+        返回 (ok, message)。余额不足等业务拒绝不重试。
+        """
+        url = "%s/donate?topic_id=%d" % (self.base, tid)
+        code, html, _ = self.http.get(url)
+        if code != 200:
+            return False, "打赏页打开失败 code=%s" % code
+
+        form = self.parse_donate_form(html)
+        if not form:
+            return False, "打赏页里没有找到表单(可能已登录失效/已打赏过/不可打赏)"
+
+        fields = [("_csrf", form["_csrf"]),
+                  ("topic_id", form["topic_id"] or str(tid)),
+                  ("request_key", form["request_key"]),
+                  ("amount", str(int(amount)))]
+        code, body, _ = self.http.post_multipart(
+            self.base + "/donate", fields,
+            extra_headers={"Origin": self.base, "X-Requested-With": "XMLHttpRequest"},
+            referer=url)
+        if code == 0:
+            return False, "打赏请求失败: %s" % body
+
+        # 成功时服务端可能重定向回帖子页,或返回 JSON/HTML 提示
+        try:
+            j = json.loads(body)
+            if j.get("ok") or j.get("success"):
+                return True, j.get("message") or j.get("tip") or "打赏成功"
+            if j.get("message") or j.get("tip"):
+                return False, j.get("message") or j.get("tip")
+        except (ValueError, TypeError):
+            pass
+        low = body.lower()
+        if "不足" in body or "余额" in body:
+            return False, "积分不足"
+        if "已打赏" in body or "已点赞" in body:
+            return False, "已打赏过(不能重复)"
+        if code in (200, 302) and ("<html" in low or code == 302):
+            # 重定向回帖子页 = 表单提交被接受
+            return True, "打赏成功"
+        return False, "返回异常 code=%s: %s" % (code, strip_tags(body)[:150])
+
 
 # 向后兼容:早期代码用的是模块级 solve_pow
 from .captcha import solve_pow  # noqa: E402,F401

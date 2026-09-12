@@ -125,6 +125,31 @@ class Bot:
             log("  联网搜索失败(忽略,继续生成): %s" % e, "WARN")
             return ""
 
+    def _donate_after_reply(self, topic):
+        """回帖成功后给楼主打赏(点赞 + 积分)。
+
+        只尽力而为:打赏失败只告警,不影响回帖结果,也不重试 ——
+        重试有双倍打赏的风险,宁可少打不能多打。
+        """
+        if not self.cfg.get("donate_enabled", True):
+            return
+        amount = int(self.cfg.get("donate_amount", 1) or 0)
+        if amount <= 0:
+            return
+        # 不给自己打赏(理论上 bot 不会回自己的帖,兜个底)
+        if (topic.get("op_name") or "") == (self.cfg.get("bot_username") or ""):
+            return
+        try:
+            ok, msg = self.site.donate_topic(topic["tid"], amount)
+            if ok:
+                log("  已打赏 #%d 楼主 %d 积分: %s"
+                    % (topic["tid"], amount, msg))
+            else:
+                log("  打赏 #%d 未成功: %s (不重试,避免双倍)"
+                    % (topic["tid"], msg), "WARN")
+        except Exception as e:
+            log("  打赏 #%d 异常: %s" % (topic["tid"], e), "WARN")
+
     # ------------------------------------------------------------------
     # 单轮
     # ------------------------------------------------------------------
@@ -217,6 +242,7 @@ class Bot:
             self.store.save_reply(tid, topic.get("title", ""), text, "ok")
             self.store.incr_today()
             log("  已发布 #%d: %s" % (tid, msg))
+            self._donate_after_reply(topic)
             return
 
         retryable = any(k in (msg or "") for k in LsbSite.RETRYABLE)
@@ -251,6 +277,11 @@ class Bot:
                 % (cfg.get("search_mode", 1), describe_mode(cfg.get("search_mode", 1))))
         else:
             log("  联网搜索  : 关闭")
+        if cfg.get("donate_enabled", True):
+            log("  自动打赏  : 开启,回帖成功后给楼主打赏 %d 积分"
+                % int(cfg.get("donate_amount", 1) or 0))
+        else:
+            log("  自动打赏  : 关闭")
         log("  AI 接口   : %s" % ", ".join(
             p.get("name") or p.get("model") or "?"
             for p in (cfg.get("llm", {}).get("providers") or [])[:4]))
