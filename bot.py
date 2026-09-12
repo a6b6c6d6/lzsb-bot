@@ -184,9 +184,49 @@ class Store:
             created_at TEXT, result TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS daily (
             day TEXT PRIMARY KEY, count INTEGER)""")
+        # 运行心跳:用于单实例检测,防止同一台机器双开抢 state.db
+        self.db.execute("""CREATE TABLE IF NOT EXISTS runtime (
+            id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER, host TEXT, last_seen TEXT)""")
         self.db.commit()
         if new:
             log("已创建状态库 state.db")
+
+    def acquire_lock(self, stale_after=120):
+        """单实例锁。返回 (是否可以启动, 说明)。
+
+        只在「同一台机器」上拦截重复实例 —— 跨机器没法可靠判断对方是否还活着,
+        那种情况交给 should_reply 里的站点侧去重兜底。
+        """
+        import socket
+        host = socket.gethostname()
+        pid = os.getpid()
+        row = self.db.execute(
+            "SELECT pid, host, last_seen FROM runtime WHERE id=1").fetchone()
+        if row:
+            pid0, host0, last_seen = row
+            fresh = False
+            try:
+                fresh = (datetime.now()
+                         - datetime.fromisoformat(last_seen)).total_seconds() < stale_after
+            except (TypeError, ValueError):
+                fresh = False
+            if fresh and host0 == host and pid0 and pid0 != pid:
+                return False, ("本机已有实例在运行(PID %s,最后心跳 %s)"
+                               % (pid0, last_seen))
+        self.db.execute(
+            "INSERT OR REPLACE INTO runtime(id,pid,host,last_seen) VALUES(1,?,?,?)",
+            (pid, host, datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
+        return True, host
+
+    def heartbeat(self):
+        """每轮更新一次,表示"我还活着"。"""
+        import socket
+        self.db.execute(
+            "UPDATE runtime SET pid=?, host=?, last_seen=? WHERE id=1",
+            (os.getpid(), socket.gethostname(),
+             datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
 
     def mark_seen(self, tid, lastmod, title=""):
         self.db.execute(
@@ -906,7 +946,17 @@ def should_reply(cfg, topic, store):
     """返回 (是否回复, 原因)。"""
     tid = topic["tid"]
     if store.has_replied(tid):
-        return False, "已回过"
+        return False, "已回过(本地记录)"
+
+    # 【跨端去重】本地 state.db 在手机 / 电脑各有一份、互不同步,
+    # 只靠本地记录会在两端都跑时把同一个帖子回复两遍。
+    # 这里直接查站点:该帖的楼层里是否已经出现过本 bot 的发言。
+    # 这是唯一不依赖本地状态、能真实反映"我是否已回过"的判据。
+    bot_name = (cfg.get("bot_username") or "").strip()
+    if bot_name:
+        authors = {p.get("author") for p in (topic.get("posts") or [])}
+        if bot_name in authors:
+            return False, "站点上已有本 bot 的回复(跨端去重)"
     if not topic.get("can_reply"):
         return False, "页面显示未登录或不可回复"
     if topic.get("closed"):
@@ -979,6 +1029,7 @@ class Bot:
         return True
 
     def tick(self):
+        self.store.heartbeat()
         # 【检测】从各板块列表页收集候选帖。
         # 不用 sitemap:sitemap 有明显滞后(实测首页已到 21484,它最大只到 21474),
         # 靠它会漏掉新帖。板块列表页是实时渲染的,才是可靠来源。
@@ -1126,6 +1177,15 @@ class Bot:
         log("  每日上限  : %s" % cfg.get("daily_limit", 20))
         log("  屏蔽板块  : %s" % (cfg.get("deny_forums") or []))
         log("=" * 60)
+
+        # 单实例检测:同一台机器双开会让两个进程抢同一个 state.db,
+        # 造成重复回复和数据库锁冲突
+        ok, info = self.store.acquire_lock()
+        if not ok:
+            log("拒绝启动:%s" % info, "ERROR")
+            log("如果确认那个进程已经不在了,等 2 分钟(心跳过期)后重试即可", "WARN")
+            return 4
+        log("已获取运行锁(主机 %s, PID %s)" % (info, os.getpid()))
 
         # 代理掉线是常态(Clash 换节点、机场抖动),所以登录失败不退出进程,
         # 而是按退避策略重试;代理恢复后能自愈,无需人工重启。
