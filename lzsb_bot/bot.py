@@ -279,23 +279,16 @@ class Bot:
             self.store.save_notif(rid, tid, from_user, n["kind"], "skip:已锁帖")
             return False
 
-        # 按 rid 定位对方那条回复拿全文(通知页里的摘要可能被截断)
-        posts = topic.get("posts") or []
-        their = next((p for p in posts if str(p.get("pid")) == str(rid)), None)
-        their_text = (their or {}).get("content") or n["text"] or ""
-
-        # 楼层号:接话必须用「@用户 #楼层」才能盖在对方的楼里,
-        # 只 @ 用户名会变成一条独立新评论(站点约定)
-        floor = None
-        if their is not None:
-            try:
-                floor = posts.index(their) + 1      # 文档顺序即楼层顺序
-            except ValueError:
-                floor = None
+        # 楼层定位:接话必须用「@用户 #对方所在楼层」才能盖在对方的楼里,
+        # 只 @ 用户名会变成一条独立新评论。楼层号是**对方那条回复**所在的楼
+        # (站点约定:回复从 #1 起,不含楼主;通知摘要里的 #N 是对方回复的
+        # 目标楼层,不能拿来用!),定位不到就退化为纯 @ 提及,宁可不盖楼
+        # 也不能盖错楼回错人。
+        floor, their_text_full = self.site.locate_floor(tid, rid)
+        their_text = their_text_full or n["text"] or ""
         if floor is None:
-            mf = re.match(r"#(\d+)", (n["text"] or "").strip())   # 通知摘要里的 #N 兜底
-            if mf:
-                floor = int(mf.group(1))
+            log("  通知接话: 未能定位 %s 的回复楼层(审核隐藏/已删除),改用纯 @ 提及"
+                % from_user, "WARN")
         mention = "@%s" % from_user + (" #%d" % floor if floor else "")
 
         text, err = call_llm(

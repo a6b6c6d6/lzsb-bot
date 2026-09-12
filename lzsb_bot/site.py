@@ -487,6 +487,46 @@ class LsbSite:
                 break
         return out
 
+    def locate_floor(self, tid, rid, max_pages=10):
+        """定位回复 rid 在帖子中的楼层号,返回 (楼层号, 该楼文本) 或 (None, None)。
+
+        站点楼层约定(实测 21517 / 21531 确认):
+          - 楼层号**不含楼主**:第一条回复 = #1,楼主不占楼层号
+          - 回复正文里自动插入的「@作者 #N」的 N 指的是**被回复的目标楼层**,
+            不是回复者自己所在的楼层 —— 所以绝不能用通知摘要里的 #N 当自己的楼层
+        每页约 50 层,逐页扫描直到找到 pid==rid;找不到(被审核隐藏/已删除/
+        超过页数上限)返回 (None, None),调用方应退化为纯 @ 提及(不盖楼)。
+        """
+        counter = 0
+        seen = set()
+        for page in range(1, max(1, max_pages) + 1):
+            url = "%s/topic/%d" % (self.base, tid)
+            if page > 1:
+                url += "?page=%d" % page
+            code, html, _ = self.http.get(url)
+            if code != 200:
+                break
+            posts = parse_posts(html)
+            if not posts:
+                break
+            # 超页时站点会回退渲染第一页(首项=楼主),据此判定到头了
+            if page > 1 and posts[0]["pid"] == str(tid):
+                break
+            new_found = False
+            for i, p in enumerate(posts):
+                if p["pid"] in seen:
+                    continue
+                seen.add(p["pid"])
+                new_found = True
+                if page == 1 and i == 0:
+                    continue            # 楼主不占楼层号
+                counter += 1
+                if str(p["pid"]) == str(rid):
+                    return counter, p["content"]
+            if not new_found:
+                break
+        return None, None
+
     # ==================================================================
     # 打赏(点赞 + 积分)
     # ==================================================================
