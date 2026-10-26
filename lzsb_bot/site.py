@@ -12,10 +12,12 @@
   (首页已到 21484,它最大只到 21474),靠它会漏新帖。
 """
 
+import base64
 import http.cookiejar
 import json
 import re
 import time
+import urllib.parse
 
 from .captcha import get_cap_token
 from .html import (extract_csrf, extract_div_inner, div_to_text, html_unescape,
@@ -657,6 +659,147 @@ class LsbSite:
             return True, "打赏成功"
         return False, "返回异常 code=%s: %s" % (code, strip_tags(body)[:150])
 
+
+
+    # ==================================================================
+    # 抽卡(称号抽取 /gacha)
+    # ------------------------------------------------------------------
+    # 站点 2026-10-06 实测:
+    #   POST /gacha_pull      单抽   10 积分
+    #   POST /gacha_pull_10   十连   90 积分
+    #   POST /gacha_pull_100  百连  800 积分
+    # 请求体只有 _csrf —— 抽什么完全由服务端决定,客户端没有任何可影响随机的地方。
+    # 响应:302 → /gacha_pull?result=<32位hex>,并下发签名 cookie
+    #       gacha_pull_result_single = base64(json) + "." + hmac
+    # json = {"token":..., "data":{"title_id":N,"empty":bool,
+    #         "is_new":bool,"quantity":M}}
+    # title_id=0 表示空手;1..23 是称号,顺序与 /gacha 页「全部称号」一致。
+    # ==================================================================
+    GACHA_TITLES = {
+        0:  ("--",  "（空）"),
+        1:  ("N",   "萌新"),       2:  ("N",   "潜水员"),     3:  ("N",   "吃瓜群众"),
+        4:  ("N",   "路人甲"),     5:  ("N",   "打酱油的"),   6:  ("R",   "常客"),
+        7:  ("R",   "话题王"),     8:  ("R",   "回复达人"),   9:  ("R",   "夜猫子"),
+        10: ("R",   "表情包大户"), 11: ("SR",  "论坛之星"),   12: ("SR",  "万人迷"),
+        13: ("SR",  "键盘侠"),     14: ("SR",  "精华收割机"), 15: ("SR",  "社交达人"),
+        16: ("SSR", "欧皇"),       17: ("SSR", "氪金大佬"),   18: ("SSR", "传说之龙"),
+        19: ("SSR", "全站偶像"),   20: ("SSR", "管理员之友"), 21: ("SSR", "隐藏大佬"),
+        22: ("SSR", "富可敌国"),   23: ("R",   "反贼"),
+    }
+    GACHA_ENDPOINTS = {
+        "/gacha_pull":     (1,   10,  "单抽"),
+        "/gacha_pull_10":  (10,  90,  "十连"),
+        "/gacha_pull_100": (100, 800, "百连"),
+    }
+
+    def get_gacha_points(self, html=None):
+        """当前积分(优先从 /gacha 页解析)。失败返回 None。"""
+        if html is None:
+            code, html, _ = self.http.get(self.base + "/gacha")
+            if code != 200 or not html:
+                return None
+        m = re.search(r"积分\s*[:：]?\s*(?:<strong>\s*)?([0-9][0-9,]*)", html)
+        return int(m.group(1).replace(",", "")) if m else None
+
+    def _gacha_csrf(self):
+        """取抽卡用的 _csrf。优先读 /gacha 页面,兜底 bbs_csrf cookie(两者同值)。"""
+        code, html, _ = self.http.get(self.base + "/gacha")
+        csrf = extract_csrf(html) if (code == 200 and html) else None
+        if not csrf:
+            # 页面抓取失败时仍然兜底:_csrf 与 bbs_csrf cookie 同值
+            csrf = self.http.get_cookie("bbs_csrf")
+        return (csrf or None), html
+
+    def _read_gacha_cookie(self):
+        """从 cookie jar 里找 gacha_pull_result_* 签名 cookie。"""
+        best = None
+        for c in self.http.jar:
+            if c.name.startswith("gacha_pull_result_"):
+                best = c.value
+        return best
+
+    def _decode_gacha_cookie(self, value):
+        """解码签名 cookie → dict。带 'pulled' 的(百连)取最后一条。"""
+        if not value or "." not in value:
+            return None
+        payload, sig = value.rsplit(".", 1)
+        try:
+            b64 = urllib.parse.unquote(payload).strip()
+            obj = json.loads(base64.b64decode(b64 + "=" * (-len(b64) % 4)))
+        except Exception:
+            return None
+        data = obj.get("data") or {}
+        if "pulled" in data:
+            seq = data.get("pulled") or []
+            if not seq:
+                return None
+            item = seq[-1]
+            data = {"title_id": item[0], "empty": bool(item[1]),
+                    "is_new": bool(item[2]), "quantity": item[3]}
+        return {
+            "title_id": data.get("title_id", 0) if not data.get("empty") else 0,
+            "empty": bool(data.get("empty")),
+            "is_new": bool(data.get("is_new")),
+            "quantity": data.get("quantity", 1),
+            "token": obj.get("token"),
+            "sig_ok": len(sig) == 64,
+        }
+
+    def _parse_gacha_result_html(self, html):
+        """结果页 HTML 兜底解析(签名 cookie 拿不到时用)。"""
+        if not html:
+            return None
+        if "什么都没抽到" in html:
+            return {"title_id": 0, "empty": True, "is_new": False,
+                    "quantity": 1, "from_html": True}
+        m = re.search(r'gacha-result-rarity"[^>]*>([^<]+)<', html)
+        n = re.search(r'gacha-result-name"[^>]*>([^<]+)<', html)
+        if not (m and n):
+            return None
+        q = re.search(r"获得\s*×\s*([0-9]+)", html)
+        return {"title_id": None,
+                "tier": html_unescape(strip_tags(m.group(1))).strip(),
+                "name": html_unescape(strip_tags(n.group(1))).strip(),
+                "empty": False, "is_new": "已累计" not in html,
+                "quantity": int(q.group(1)) if q else 1,
+                "from_html": True}
+
+    def gacha_pull_once(self, endpoint="/gacha_pull"):
+        """抽一次。返回 dict(ok/稀有度/称号/是否新/份数/结果页URL)。
+
+        结果以**服务端下发的签名 cookie**为准(cookie 解析不了才回退解析页面)。
+        """
+        ep = endpoint if endpoint in self.GACHA_ENDPOINTS else "/gacha_pull"
+        csrf, html = self._gacha_csrf()
+        if not csrf:
+            return {"ok": False, "message": "拿不到 _csrf(登录可能已失效)"}
+
+        code, body, final = self.http.post(
+            self.base + ep, {"_csrf": csrf}, referer=self.base + "/gacha",
+            extra_headers={"Origin": self.base,
+                           "Upgrade-Insecure-Requests": "1"})
+
+        if code == 0:
+            return {"ok": False, "message": "请求失败: %s" % body}
+        if "/login" in (final or ""):
+            return {"ok": False, "message": "会话已失效(被重定向到 /login)"}
+
+        res = self._decode_gacha_cookie(self._read_gacha_cookie())
+        if not res:
+            res = self._parse_gacha_result_html(body)
+        if not res:
+            return {"ok": False, "code": code,
+                    "message": "结果无法解析(HTTP %s, final=%s)" % (code, final)}
+
+        tid = res.get("title_id")
+        if tid is None:
+            tier, name = res.get("tier", "??"), res.get("name", "?")
+        else:
+            tier, name = self.GACHA_TITLES.get(tid, ("??", "未知-%s" % tid))
+        out = dict(res)
+        out.update({"ok": True, "code": code, "title_id": tid,
+                    "tier": tier, "name": name, "url": final})
+        return out
 
 # 向后兼容:早期代码用的是模块级 solve_pow
 from .captcha import solve_pow  # noqa: E402,F401
