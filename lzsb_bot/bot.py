@@ -16,13 +16,14 @@ import random
 import re
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .config import SEARCH_MODE_LABELS
 from .filters import should_reply
 from .log import log
 from .llm import call_llm, extract_keywords
-from .prompt import (DEFAULT_SYSTEM_PROMPT, NOTIFY_SYSTEM, PLAN_SYSTEM,
+from .prompt import (DEFAULT_SYSTEM_PROMPT, DONATE_SYSTEM, NOTIFY_SYSTEM,
+                     PLAN_SYSTEM, build_donate_prompt,
                      build_notify_user_prompt, build_user_prompt)
 from .site import LsbSite
 from .store import Store
@@ -31,9 +32,10 @@ from .search import format_block, build_query, describe_mode
 
 
 class Bot:
-    def __init__(self, cfg, dry_run=None, once=False):
+    def __init__(self, cfg, dry_run=None, once=False, donate_only=False):
         self.cfg = cfg
         self.once = once
+        self.donate_only = donate_only
         self.dry = cfg.get("dry_run", True) if dry_run is None else dry_run
         self.store = Store()
         self.site = LsbSite(cfg)
@@ -172,6 +174,158 @@ class Bot:
                     % (topic["tid"], msg), "WARN")
         except Exception as e:
             log("  打赏 #%d 异常: %s" % (topic["tid"], e), "WARN")
+
+    # ------------------------------------------------------------------
+    # 只打赏模式(不回复,AI 评分后按分打赏)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_score_json(text):
+        """从模型输出里抠出 {"score":N,"reason":"..."}。失败返回 (None, "")。
+
+        弱模型/推理模型的 JSON 常见毛病:包 ```围栏、前后带说明、score 写成
+        浮点或字符串。三层兜底:整体 loads → 截取 {..} 再 loads → 正则抠字段。
+        """
+        t = (text or "").strip()
+        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I).strip()
+        cands = [t]
+        i, j = t.find("{"), t.rfind("}")
+        if 0 <= i < j:
+            cands.append(t[i:j + 1])
+        for c in cands:
+            try:
+                obj = json.loads(c)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict) or obj.get("score") is None:
+                continue
+            try:
+                sc = int(round(float(obj["score"])))
+            except (TypeError, ValueError):
+                continue
+            return max(0, min(20, sc)), str(obj.get("reason") or "").strip()
+        m = re.search(r'"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', t)
+        if m:
+            sc = int(round(float(m.group(1))))
+            mr = re.search(r'"reason"\s*:\s*"([^"]*)"', t)
+            return max(0, min(20, sc)), (mr.group(1) if mr else "")
+        return None, ""
+
+    def _score_topic(self, topic):
+        """让 AI 给帖子评 1-20 分。返回 (score, reason) 或 (None, 错误说明)。"""
+        text, err = call_llm(self.cfg, DONATE_SYSTEM,
+                             build_donate_prompt(topic), strict_tail=False)
+        if err or not text:
+            return None, err or "模型空输出"
+        score, reason = self._parse_score_json(text)
+        if score is None:
+            return None, "评分解析失败: %s" % (text or "")[:80]
+        return score, reason
+
+    def _claim_daily_rewards(self):
+        """领一次广告位每日积分(失败不影响后续打赏)。"""
+        try:
+            ok, msg = self.site.claim_promotions_reward()
+            log("  每日领积分: %s" % msg, "INFO" if ok else "WARN")
+            return ok
+        except Exception as e:
+            log("  每日领积分异常: %s" % e, "WARN")
+            return False
+
+    def _try_claim_rewards(self):
+        """尝试领每日积分(所有模式共用)。
+
+        领积分走 Playwright 启动浏览器(十几秒起),开销远大于普通请求,不能每轮
+        都试;但也不能「每天只试一次、失败就作罢」——登录/网络抽风时当天奖励就
+        白丢了(2026-10-12 那次中断回退 HTTP 拿到 0 就是这种情况)。策略:
+          * 今天已经领到过 → 跳过;
+          * 今天已试过但没领到 → 隔 reward_retry_minutes 分钟补试,
+            当天最多 reward_max_tries 次,既容忍偶发失败又不至于反复空转;
+          * 领成功就记 claimed,当天不再动。
+
+        dry 模式不领,避免测试时白耗当天机会。
+        """
+        if self.dry or self.store.claimed_reward_today():
+            return
+        tries, last = self.store.reward_tries_today()
+        max_tries = int(self.cfg.get("reward_max_tries", 3) or 3)
+        if tries >= max_tries:
+            return
+        cooldown = int(self.cfg.get("reward_retry_minutes", 30) or 0)
+        if last is not None and cooldown > 0:
+            if datetime.now() - last < timedelta(minutes=cooldown):
+                return
+        self.store.mark_reward_try()
+        if self._claim_daily_rewards():
+            self.store.mark_reward_claimed()
+
+    def _donate_only_tick(self):
+        """只打赏单轮:查余额 → 扫新帖 → AI 评分 → 按分打赏。
+
+        打赏总额受「余额 - 保留线」约束,不会把积分打光;每帖只处理一次
+        (评分过就记库),既防止重复评分刷 AI,也防止重复打赏。
+        每日领积分已提到 run() 里对所有模式统一处理。
+        """
+        self.store.heartbeat()
+
+        balance = self.site.get_my_points()
+        if balance is None:
+            log("  查不到积分余额,本轮跳过", "WARN")
+            return
+        reserve = int(self.cfg.get("donate_reserve", 200) or 0)
+        budget = balance - reserve
+        log("  当前积分 %d,保留底线 %d,可用打赏预算 %d" % (balance, reserve, budget))
+        if budget < 1:
+            log("  预算不足(余额已接近保留线),本轮不打赏", "WARN")
+            return
+
+        max_n = int(self.cfg.get("donate_max_per_tick", 10) or 10)
+        min_score = int(self.cfg.get("donate_min_score", 1) or 1)
+        done = 0
+        for tid in self._collect_candidates():
+            if not self.running or budget < 1 or done >= max_n:
+                break
+            if self.store.has_donated(tid):
+                continue
+            topic = self.site.fetch_topic(tid)
+            if not topic:
+                continue
+            if (topic.get("op_name") or "") == (self.cfg.get("bot_username") or ""):
+                continue                       # 不给自己打赏
+
+            score, reason = self._score_topic(topic)
+            if score is None:
+                log("  评分失败 #%d: %s" % (tid, reason), "WARN")
+                continue
+            log("  #%d 「%s」AI 评分 %d/20 — %s"
+                % (tid, (topic.get("title") or "")[:36], score, reason))
+
+            amount = 0
+            if score <= 0:
+                log("  AI 判定无价值(0 分),不打赏")
+            elif score < min_score:
+                log("  评分低于阈值 %d,不打赏" % min_score)
+            else:
+                amount = min(score, budget)
+                if self.dry:
+                    log("  [DRY-RUN] 拟打赏 #%d %d 积分(未提交)" % (tid, amount))
+                    budget -= amount
+                    done += 1
+                else:
+                    try:
+                        ok, msg = self.site.donate_topic(tid, amount)
+                    except Exception as e:
+                        ok, msg = False, "异常 %s" % e
+                    if ok:
+                        log("  已打赏 #%d %d 积分: %s" % (tid, amount, msg))
+                        budget -= amount
+                        done += 1
+                    else:
+                        log("  打赏 #%d 未成功: %s" % (tid, msg), "WARN")
+                        amount = 0
+            # 记库:避免同帖反复评分、反复尝试打赏(dry 模式只读,不写库)
+            if not self.dry:
+                self.store.save_donation(tid, score, amount)
 
     # ------------------------------------------------------------------
     # 跨端同步(个人主页回复)
@@ -697,6 +851,12 @@ class Bot:
             for p in (cfg.get("llm", {}).get("providers") or [])[:4]))
         log("  历史状态  : 已见 %d 帖 / 已回 %d 帖 / 今日 %d 帖"
             % (st["seen"], st["replied"], st["today"]))
+        if self.donate_only:
+            log("  运行模式  : 只打赏(不回复,AI 评分 0-20,0 分无价值不打赏)")
+            log("  打赏策略  : 预算 = 余额 - 保留 %d;单轮最多 %s 帖,低于 %s 分不打"
+                % (int(cfg.get("donate_reserve", 200) or 0),
+                   cfg.get("donate_max_per_tick", 10),
+                   cfg.get("donate_min_score", 1)))
         log("=" * 60)
 
     def run(self):
@@ -735,8 +895,14 @@ class Bot:
                     self.bootstrap()
                 bootstrapped = True
 
+            # 每次运行都尝试领一下每日积分(所有模式共用;今天已领到就跳过)
+            self._try_claim_rewards()
+
             try:
-                if self.cfg.get("passive_mode"):
+                if self.donate_only:
+                    # 只打赏模式:不回复,只扫新帖 AI 评分后按分打赏
+                    self._donate_only_tick()
+                elif self.cfg.get("passive_mode"):
                     # 被动模式:不主动回新帖,只在被 @ 时回应
                     self._handle_notifications()
                 else:

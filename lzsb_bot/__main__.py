@@ -167,6 +167,8 @@ def main(argv=None):
                     help="抽卡每次之间的间隔秒数(默认 0.6)")
     ap.add_argument("--gacha-dry", action="store_true",
                     help="抽卡:只看积分和计划,不真的抽")
+    ap.add_argument("--donate-only", action="store_true",
+                    help="只打赏模式:不回复,AI 评分后按分打赏积分为帖子")
     args = ap.parse_args(argv)
 
     # --search 不需要 config,允许在没有 config.json 时先验证搜索链路
@@ -211,7 +213,8 @@ def main(argv=None):
             return 0
         return 3
 
-    bot = Bot(cfg, dry_run=True if args.dry else None, once=args.once)
+    bot = Bot(cfg, dry_run=True if args.dry else None, once=args.once,
+              donate_only=args.donate_only)
     signal.signal(signal.SIGINT, bot.stop)
     try:
         signal.signal(signal.SIGTERM, bot.stop)

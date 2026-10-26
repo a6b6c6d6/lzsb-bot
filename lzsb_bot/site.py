@@ -659,6 +659,240 @@ class LsbSite:
             return True, "打赏成功"
         return False, "返回异常 code=%s: %s" % (code, strip_tags(body)[:150])
 
+    # ==================================================================
+    # 积分:余额查询 + 每日领取(广告位奖励)
+    # ==================================================================
+
+    def get_my_points(self):
+        """查询自己当前积分余额(从个人主页解析「积分 N」)。失败返回 None。"""
+        uid = self.get_own_uid()
+        if not uid:
+            return None
+        code, html, _ = self.http.get("%s/user/%d" % (self.base, uid))
+        if code != 200 or not html:
+            return None
+        m = re.search(r"积分\s*([0-9][0-9,]*)", html)
+        return int(m.group(1).replace(",", "")) if m else None
+
+    def claim_promotions_reward(self):
+        """每日领取广告位积分。
+
+        实测结论(2026-09-21):**纯 HTTP POST 拿不到**这个奖励 —— 服务端要求广告板
+        真的发生「隐藏↔显示」状态切换(响应里的 triggered 必须=1),而 urllib 发出的
+        请求永远是 triggered:0(补 sec-ch-ua / Sec-Fetch-* 等浏览器特征头也无效)。
+        只有**真实浏览器点击**才触发,已用 Playwright 验证:点「显示广告」按钮或
+        广告位链接均可 +数百积分。
+
+        所以:首选 Playwright 点击;未装 playwright 或点击异常时回退纯 HTTP
+        (基本拿不到,仅作不让流程断掉的兜底)。返回 (是否领到奖励, 说明)。
+        """
+        try:
+            return self._claim_rewards_browser()
+        except ImportError:
+            pass                                   # 没装 playwright → 走兜底
+        except Exception as e:
+            log("  浏览器领积分失败: %s,回退 HTTP" % e, "WARN")
+
+        ok, msg = self._claim_rewards_http()
+        return ok, "HTTP兜底: %s" % msg
+
+    def _claim_rewards_browser(self):
+        """Playwright 真实点击领广告奖励。
+
+        ⚠ 2026-10-04 站点改了规则:每天 **3 次**广告抽奖机会,只有**带红点标记**的
+        广告位才给分。红点是随机的(每个人不一样),服务端渲染时会给中奖广告位加上
+        `data-sidebar-promotions-lottery-slot="1"`,内部再放一个
+        `span.sidebar-promotions-lottery-dot`(就是那个红点)。其余广告位点了不给分。
+
+        两类每日奖励(服务端按 reward_day 去重):
+          1) 显示奖励:POST /promotions_show 触发,每天一次 —— 广告板收起时点
+             「显示广告」会顺带领掉。
+          2) 广告抽奖:点带红点的有奖广告位 → /promotions_click,每天 3 次。
+
+        ⚠ 2026-10-12 实测(关键):广告位是 `<a target="_blank">`,点一次会新开一个
+        广告标签页;**同一次页面加载里只有第一个红点点得动** —— 第 2、3 个红点
+        Playwright 会一直等不到可点(hit-test 失败超时),连原生鼠标坐标点击也不触发
+        /promotions_click(连着好几天每天只领到 1 次就是这么来的)。所以这里改成:
+        **每点一个红点都重新加载一次 /promotions**,刷新后剩下的红点又能正常点。
+        领满 3 次后服务端会把广告板重新渲染成「收起」,于是再刷新一次正好点「显示广告」
+        把显示奖励补上。
+
+        流程(每次循环都重新加载页面):
+          打开 /promotions →(广告板收起就点「显示广告」,顺带领显示奖励)
+          → 点掉当前页面第一个可见红点 → 刷新 → 重复,直到没有红点为止。
+        点完对比余额判断是否真到账(响应里的 rewarded 字段不可信)。
+        """
+        from playwright.sync_api import sync_playwright
+
+        before = self.get_my_points()
+        proxy = self.cfg.get("proxy") or ""
+        ua = self.cfg.get("user_agent") or DEFAULT_UA
+        cookies = [{"name": c.name, "value": c.value,
+                    "domain": c.domain or ".linux.sb", "path": c.path or "/"}
+                   for c in self.http.jar]
+
+        clicked, status = [], ""
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True, proxy={"server": proxy} if proxy else None)
+            try:
+                ctx = browser.new_context(
+                    user_agent=ua, viewport={"width": 1440, "height": 900})
+                ctx.add_cookies(cookies)
+                page = ctx.new_page()
+
+                # 广告链接带 target=_blank,点一次会开一个广告标签页;随手关掉,
+                # 免得越开越多(那只是广告本身,跟领奖无关)。
+                def _close_extra(pg):
+                    try:
+                        if pg is not page:
+                            pg.close()
+                    except Exception:
+                        pass
+
+                ctx.on("page", _close_extra)
+
+                events = []
+
+                def _on_resp(r):
+                    if "/promotions_" in r.url and r.request.method == "POST":
+                        try:
+                            events.append((r.url.rsplit("/", 1)[-1],
+                                           json.loads(r.text())))
+                        except Exception:
+                            pass
+
+                page.on("response", _on_resp)
+
+                # 一轮 = 一次页面加载。每天最多 3 个红点,外加最后刷新一次补领显示
+                # 奖励,所以最多循环 5 轮。
+                for round_no in range(5):
+                    page.goto(self.base + "/promotions",
+                              wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(3500)
+
+                    # 广告板收起时点「显示广告」展开 —— 顺带领掉每日「显示奖励」
+                    btn = page.locator("button[data-sidebar-promotions-show]")
+                    if btn.count() and btn.first.is_visible():
+                        try:
+                            btn.first.click(force=True, timeout=5000)
+                            page.wait_for_timeout(2500)
+                        except Exception:
+                            pass
+
+                    # 挑当前页面「可见的红点」(领过的红点服务端不再渲染)
+                    dot, dots = None, page.locator(".sidebar-promotions-lottery-dot")
+                    for j in range(dots.count()):
+                        cand = dots.nth(j)
+                        try:
+                            if cand.is_visible():
+                                dot = cand
+                                break
+                        except Exception:
+                            continue
+                    if dot is None:
+                        break
+
+                    # ⚠ 必须点**红点所在坐标**:红点 pointer-events:none + 右下角定位
+                    #   (right:4px/top:20px),鼠标事件穿透到下面的 <a>,前端据此判定
+                    #   "点到了有奖广告位";点广告位中心(文字上)毫无反应。
+                    try:
+                        dot.scroll_into_view_if_needed(timeout=8000)
+                        page.wait_for_timeout(300)
+                        try:
+                            dot.click(timeout=6000)
+                        except Exception:
+                            box = dot.bounding_box()
+                            if not box:
+                                break
+                            page.mouse.click(box["x"] + box["width"] / 2,
+                                             box["y"] + box["height"] / 2)
+                        clicked.append("红点%d" % (round_no + 1))
+                    except Exception:
+                        break
+                    page.wait_for_timeout(2500)
+
+                # 兜底补领显示奖励:领满 3 次后服务端一般会把广告板收起,上面那轮已经
+                # 点过「显示广告」;若广告板仍是展开的,则收起再展开来领。重复做只会
+                # 返回 already_rewarded,幂等无副作用。
+                if not any(name == "promotions_show" for name, _ in events):
+                    hide_btn = page.locator("button[data-sidebar-promotions-hide]")
+                    if hide_btn.count() and hide_btn.first.is_visible():
+                        try:
+                            hide_btn.first.click(force=True, timeout=5000)
+                            page.wait_for_timeout(2000)
+                        except Exception:
+                            pass
+                        show_btn = page.locator(
+                            "button[data-sidebar-promotions-show]")
+                        if show_btn.count() and show_btn.first.is_visible():
+                            try:
+                                show_btn.first.click(force=True, timeout=5000)
+                                page.wait_for_timeout(2500)
+                            except Exception:
+                                pass
+
+                # 控制区文案会给出剩余次数与本次抽奖结果
+                try:
+                    status = (page.locator(
+                        ".sidebar-promotions-controls").first.inner_text()
+                        or "").strip()
+                except Exception:
+                    status = ""
+            finally:
+                browser.close()
+
+        after = self.get_my_points()
+        gained = (after - before) if (before is not None and after is not None) else None
+        awarded = [int(e.get("points") or 0) for _, e in events if e.get("rewarded")]
+        msg = "点击红点广告位 %d 个%s;余额 %s → %s" % (
+            len(clicked),
+            ("[" + ",".join(clicked) + "]") if clicked else "",
+            before, after)
+        if gained is not None:
+            msg += "(+%d)" % gained
+        if awarded:
+            msg += ";服务端申报奖励 %s" % "+".join(str(p) for p in awarded)
+        if status:
+            msg += ";页面提示「%s」" % status
+        return bool(gained and gained > 0), msg
+
+    def _claim_rewards_http(self):
+        """纯 HTTP 兜底(实测拿不到奖励,仅作降级路径)。"""
+        code, html, _ = self.http.get(self.base + "/promotions")
+        if code != 200 or not html:
+            return False, "打开 /promotions 失败 code=%s" % code
+        m = re.search(r'name="_csrf"[^>]*value="([^"]+)"', html)
+        if not m:
+            return False, "/promotions 里没有 _csrf"
+        csrf = html_unescape(m.group(1))
+
+        before = self.get_my_points()
+        notes = []
+        for ep in ("/promotions_show", "/promotions_click", "/promotions_hide"):
+            code, body, _ = self.http.post_multipart(
+                self.base + ep, [("_csrf", csrf)],
+                extra_headers={"X-Requested-With": "XMLHttpRequest",
+                               "Origin": self.base},
+                referer=self.base + "/promotions")
+            if code == 0:
+                notes.append("%s 请求失败" % ep)
+                continue
+            try:
+                j = json.loads(body)
+                notes.append("%s: %s" % (
+                    ep, j.get("message") or ("rewarded=%s" % j.get("rewarded"))))
+            except (ValueError, TypeError):
+                notes.append("%s 非 JSON: %s" % (ep, (body or "")[:40]))
+        after = self.get_my_points()
+
+        # ⚠ 响应里的 rewarded 字段**不准**(实测只报 1,实际加了 975),
+        #   是否领到一律以**余额变化**为准。
+        gained = (after - before) if (before is not None and after is not None) else None
+        summary = "余额 %s → %s" % (before, after)
+        if gained is not None:
+            summary += "(+%d)" % gained
+        return bool(gained and gained > 0), "%s; %s" % (summary, "; ".join(notes))
 
 
     # ==================================================================

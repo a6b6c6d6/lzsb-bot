@@ -64,6 +64,15 @@ DEFAULTS = {
     "donate_enabled": True,
     "donate_amount": 1,
 
+    # ---- 只打赏模式(不回复,AI 评分后按分打赏) ----
+    "donate_reserve": 200,       # 保留不动的积分底线(可用预算 = 余额 - 此值)
+    "donate_max_per_tick": 10,   # 单轮最多打赏几个帖子
+    "donate_min_score": 1,       # AI 评分低于此分不打赏(1=全都打)
+
+    # ---- 每日领积分(广告奖励)自动补试 ----
+    "reward_max_tries": 3,       # 每天最多试几次领广告奖励(失败会隔一段时间补试)
+    "reward_retry_minutes": 30,  # 上次没领到,隔多少分钟再补试
+
     # ---- 跨端同步 ----
     "sync_replies_pages": 2,
 

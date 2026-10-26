@@ -43,6 +43,10 @@ class Store:
         self.db.execute("""CREATE TABLE IF NOT EXISTS notifs (
             rid INTEGER PRIMARY KEY, tid INTEGER, from_user TEXT, kind TEXT,
             processed_at TEXT, result TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS donations (
+            tid INTEGER PRIMARY KEY, score INTEGER, amount INTEGER, created_at TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS kv (
+            k TEXT PRIMARY KEY, v TEXT)""")
         self.db.commit()
         if new:
             log("已创建状态库 state.db")
@@ -169,6 +173,68 @@ class Store:
             (rid, tid, from_user, kind,
              datetime.now().isoformat(timespec="seconds"), result))
         self.db.commit()
+
+    # ---- donations(只打赏模式:给帖子打赏的记录) --------------------------
+
+    def has_donated(self, tid):
+        """该帖是否已打赏过(避免重复打赏,站点也会拒,但本地先挡一道)。"""
+        return self.db.execute(
+            "SELECT 1 FROM donations WHERE tid=?", (tid,)).fetchone() is not None
+
+    def save_donation(self, tid, score, amount):
+        self.db.execute(
+            "INSERT OR REPLACE INTO donations(tid,score,amount,created_at) "
+            "VALUES(?,?,?,?)",
+            (tid, int(score), int(amount),
+             datetime.now().isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def donations_today_count(self):
+        d = date.today().isoformat()
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM donations WHERE substr(created_at,1,10)=?",
+            (d,)).fetchone()
+        return row[0] if row else 0
+
+    # ---- kv(杂项状态,如「今天是否已领过积分」) ---------------------------
+
+    def get_kv(self, k, default=None):
+        row = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+        return row[0] if row else default
+
+    def set_kv(self, k, v):
+        self.db.execute("INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)", (k, str(v)))
+        self.db.commit()
+
+    def claimed_reward_today(self):
+        """今天是否已领过每日积分(避免重复领,每天只领一次)。"""
+        return self.get_kv("reward_claimed") == date.today().isoformat()
+
+    def mark_reward_claimed(self):
+        self.set_kv("reward_claimed", date.today().isoformat())
+
+    def reward_tries_today(self):
+        """今天已尝试领奖的次数 + 最近一次尝试时间(今天没试过则 (0, None))。
+
+        领积分要走 Playwright 启动浏览器(十几秒起),开销远大于普通请求,不能每轮
+        都试;但也不该「试一次就作罢」——登录/网络一旦抽风当天奖励就白丢了。所以
+        把次数和时间记下来,由调用方按冷却时间补试。
+        """
+        if self.get_kv("reward_tries_date") != date.today().isoformat():
+            return 0, None
+        tries = int(self.get_kv("reward_tries") or 0)
+        last = self.get_kv("reward_last_try")
+        try:
+            return tries, (datetime.fromisoformat(last) if last else None)
+        except ValueError:
+            return tries, None
+
+    def mark_reward_try(self):
+        tries, _ = self.reward_tries_today()
+        self.set_kv("reward_tries_date", date.today().isoformat())
+        self.set_kv("reward_tries", tries + 1)
+        self.set_kv("reward_last_try",
+                    datetime.now().isoformat(timespec="seconds"))
 
     # ---- 统计 -------------------------------------------------------------
 

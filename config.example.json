@@ -52,6 +52,10 @@
   "donate_enabled": true,
   "donate_amount": 1,
 
+  "_领积分说明": "每日广告奖励(3 次红点广告 + 1 次显示奖励)在启动/轮询时自动领。失败(登录掉线、网络抖动)不会当天作罢:隔 reward_retry_minutes 分钟自动补试,当天最多 reward_max_tries 次",
+  "reward_max_tries": 3,
+  "reward_retry_minutes": 30,
+
   "_跨端同步说明": "启动时从个人主页「回复」标签页(公开页面)拉取 bot 站点上已有的回复并标记到本地,手机/电脑两端各跑也不会重复回帖。sync_replies_pages = 同步几页(0 = 关闭)",
   "sync_replies_pages": 2,
 
