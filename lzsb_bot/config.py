@@ -55,7 +55,6 @@ DEFAULTS = {
 
     "bootstrap_threshold": 20,
     "max_per_tick": 5,
-    "max_topic_age_minutes": 1440,
 
     "skip_gacha": True,
     "context_scope": "op",

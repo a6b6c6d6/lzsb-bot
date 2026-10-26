@@ -42,7 +42,6 @@
   "_安全阀说明": "防挖坟。单轮出现超过 bootstrap_threshold 个未见过帖子 → 判定为首次运行/长期停摆,只标记不回复;单轮最多处理 max_per_tick 个",
   "bootstrap_threshold": 20,
   "max_per_tick": 5,
-  "max_topic_age_minutes": 1440,
 
   "system_prompt": "",
 
