@@ -435,13 +435,13 @@ class LsbSite:
         """拉「我的通知」,返回 [{kind, from_user, from_uid, tid, rid, title,
         text, time_text}, ...],按时间倒序。
 
-        页面结构实测(2026-09-12,需登录):
+        页面结构实测(需登录):
             <li class="post-item notification-item">
-              <a class="post-title" href="/user/26996">浩辰大王</a>
+              <a class="post-title" href="//user/<uid>">通知者昵称</a>
               <span class="post-user-group notification-kind">提及</span>
               <div class="post-meta"><span>34分钟前</span></div>
-              在主题《<a href="/topic/21563?replyid=178205">标题</a>》中提到你：
-              <a class="post-mention" ...>@我是个bot</a> 对方的回复内容…
+              在主题《<a href="/topic/<tid>?replyid=<rid>">主题标题</a>》中提到你：
+              <a class="post-mention" ...>@你的Bot显示名</a> 对方的回复内容…
         rid(对方回复 id)是通知的唯一键,用于去重。
         """
         uid = self.get_own_uid()
@@ -531,7 +531,7 @@ class LsbSite:
         return None, None
 
 
-# ==================================================================
+    # ==================================================================
     # 私信
     # ==================================================================
 

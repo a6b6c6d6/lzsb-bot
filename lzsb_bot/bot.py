@@ -405,6 +405,23 @@ class Bot:
         return None, None
 
     @staticmethod
+    def _strip_inner_mentions(text, names):
+        """把正文里对他人的 @ 提及降级成纯文本。
+
+        模型经常无视「不要 @ 任何人」,在正文里写 @某某 举例(实测回复里
+        出现过 @Sam.Altman、@温庭筠),会给毫不相干的第三方刷通知。
+        只匹配**已知的论坛用户名**(当事人 + 本帖楼层作者),不用通用的
+        @\\w+ 正则 —— 否则 `@property`、装饰器、邮箱全都会被误伤。
+        保留名字本身(只去掉 @ 和楼层号),句子读起来不会缺主语。
+        """
+        if not text:
+            return text
+        known = {(n or "").strip() for n in names}
+        for nm in sorted((n for n in known if n), key=len, reverse=True):
+            text = re.sub(r'@%s(?:\s*#\d+)?' % re.escape(nm), nm, text)
+        return re.sub(r'[ \t]{2,}', ' ', text)
+
+    @staticmethod
     def _clean_reply_text(reply):
         """回复正文最后清理:剥掉模型漏写的渠道标记/Markdown 加粗符号。"""
         if not reply:
@@ -420,10 +437,28 @@ class Bot:
     # 模型被注入的概率无法降为零,这里是最后一道代码防线。
     LEAK_MARKERS = (
         "NOTIFY_SYSTEM", "DEFAULT_SYSTEM_PROMPT", "PLAN_SYSTEM",
-        "热心老用户,大家有事会 @ 你", "对方给你派了任务",
         "ignore all previous", "ignore previous instructions",
         "disregard all previous",
     )
+
+    # 只靠固定字符串对不上:实测那次泄漏(把渠道判断规则 1/2/3 复述进私信)
+    # 一个 marker 都没命中。改成匹配「谈论自己的规则/身份」这种元话语句式,
+    # 同时避开站里正常的技术用词(SQL 注入、shell 指令、聊提示词工程都不算)。
+    LEAK_PATTERNS = tuple(re.compile(p, re.I) for p in (
+        r'我(?:的|这边的|当前|现在)?(?:系统)?(?:提示词|人设)(?:是|有|包括|：|:)',
+        r'(?:系统|内部|上面的)(?:提示词|提示|设定|规则)',
+        r'(?:忽略|无视)(?:之前|上面|前面)(?:所有)?(?:的)?指令',
+        r'我(?:会|只会|只能)(?:根据|按照)帖子内容',
+        r'(?:私信还是公开|公开还是私信)',
+        r'绝不(?:会)?主动发起(?:对话|聊天|私信)',
+        r'(?:绕过|无视|忽略)(?:系统|安全)(?:的)?(?:设定|策略)',
+        r'我(?:直接)?(?:已经?|就)?(?:忽略|无视|过滤)(?:了|掉)?(?:「|“)?(?:协议|指令)',
+        r'(?:协议|指令)部(?:分|内容)',
+        r'(?:系统|安全)测试或(?:恶作剧|试探)',
+        r'老用户模式',
+        r'作为(?:一个)?\s*(?:AI|ai|人工智能|语言模型|大模型)',
+        r'我(?:是|只是)(?:一个)?(?:语言模型|大模型|AI\s*助手)',
+    ))
 
     # 常见顶级域名:用于从回复里抠出"域名",与源材料比对
     DOMAIN_RE = re.compile(
@@ -463,22 +498,69 @@ class Bot:
         for m in cls.LEAK_MARKERS:
             if m.lower() in low:
                 return True
+        for pat in cls.LEAK_PATTERNS:
+            if pat.search(text):
+                return True
         if text.count("http") > 3:            # 疑似被利用发垃圾链接
             return True
         return False
 
-    @staticmethod
-    def _drop_question_sentences(text):
-        """兜底防线:删掉含问号的短语。
+    # 句末标点:切句用。半角 ! . ; 和换行必须算在内 —— 旧实现的停止集只有
+    # 全角几个字符,删问句时会一路吃穿前面整段(实测 36 字删剩 10 字)。
+    _SENT_ENDERS = "。！？…；!?;\n"
+    _QUESTION_RE = re.compile(r"[？?]")
 
-        弱模型经常无视"不要问号"的指令;站点氛围下回帖带问号容易显得挑事。
-        策略:把「上一句终点(。！…~”)之后一直到 ？(含)」的片段整段删掉,
-        只伤发问的那半句,保住其余内容;删完太短才保底返回原文。
+    @classmethod
+    def _split_sentences(cls, text):
+        """无损切句:拼回去与原文完全一致(标点、换行都留在句尾)。"""
+        out, start, n = [], 0, len(text)
+        for i, ch in enumerate(text):
+            if ch in cls._SENT_ENDERS and (i + 1 >= n
+                                           or text[i + 1] not in cls._SENT_ENDERS):
+                out.append(text[start:i + 1])
+                start = i + 1
+        if start < n:
+            out.append(text[start:])
+        return out
+
+    @classmethod
+    def _tame_questions(cls, text, keep=1):
+        """收敛问句:删掉结尾的问句,正文里最多留 keep 句。
+
+        站点氛围下回帖以提问收尾容易显得挑事,但「一个问号都不许有」是做不到的
+        硬规则,模型必然违反。旧实现用一条正则从「上一个句号」删到「?」,停止集
+        缺换行和半角标点,会把前面整段一起删掉(日志里那些以「不过既然你问了」
+        开头的回复就是被删剩的残句)。现在先无损切句,再只删该删的那一句。
         """
-        if "？" not in text and "?" not in text:
+        if not text or not cls._QUESTION_RE.search(text):
             return text
-        out = re.sub(r"[^。！…~”]*[？?]\s*", "", text).strip()
-        return out if len(out) >= 10 else text
+        sents = cls._split_sentences(text)
+        is_q = [bool(cls._QUESTION_RE.search(s)) for s in sents]
+
+        while sents and is_q[-1]:             # 不要以提问收尾
+            sents.pop()
+            is_q.pop()
+
+        kept, out = 0, []
+        for s, q in zip(sents, is_q):
+            if q:
+                kept += 1
+                if kept > keep:               # 超出配额的问句整句丢掉
+                    continue
+            out.append(s)
+
+        cleaned = re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+        return cleaned if len(cleaned) >= 10 else text
+
+    @classmethod
+    def _truncate(cls, text, limit):
+        """硬上限截断,但尽量断在句子边界,不切在半句上。"""
+        if not text or len(text) <= limit:
+            return text
+        head = text[:limit]
+        cut = max(head.rfind(c) for c in cls._SENT_ENDERS)
+        # 砍掉超过一半内容就不值得凑整了,宁可保内容按原长截断
+        return head[:cut + 1].strip() if cut >= limit // 2 else head.strip()
 
     def _handle_notifications(self):
         """处理「我的通知」:有人回复/提及 bot 时,针对对方的话生成一条
@@ -525,7 +607,7 @@ class Bot:
                 self.store.save_notif(rid, tid, from_user, kind, "skip:自己")
                 continue
             if handled >= maxn:
-                continue                      # 留给下一轮,不标记
+                break                         # 留给下一轮,不标记
             if not self.dry and self.store.today_count() >= self.cfg.get("daily_limit", 20):
                 return
 
@@ -556,10 +638,18 @@ class Bot:
             self.store.save_notif(rid, tid, from_user, n["kind"], "skip:已锁帖")
             return False
 
+        # 先定位对方那条回复,拿到**全文**再生成 —— 通知页的摘要只截到第一个
+        # </p>,多段留言喂给模型就只剩第一段。楼层号顺手拿到,公开回复要用。
+        floor, their_text_full = self.site.locate_floor(tid, rid)
+        their_text = (their_text_full or "").strip() or n["text"]
+
         # 渠道(dm=私信 / post=帖子内回复)与回复内容由模型判断,输出 JSON。
+        # strict_tail=False:这里的输出是 JSON,句尾永远是 `"}`,开着必然误报
         text, err = call_llm(
             self.cfg, NOTIFY_SYSTEM,
-            build_notify_user_prompt(topic, from_user, n["text"], n["text"]))
+            build_notify_user_prompt(topic, from_user, their_text, n["text"],
+                                     bot_name=self.cfg.get("bot_username") or ""),
+            strict_tail=False)
         if err or not text:
             # LLM 临时故障(限速/无渠道)不该消费掉通知:不标记,留待下轮重试;
             # 连续 3 次都失败才标记放弃,防止接口长期宕机时空转
@@ -578,16 +668,26 @@ class Bot:
         if not reply:
             channel, reply = "post", text
             log("  通知接话: JSON 解析失败,按公开回复兜底", "WARN")
-        reply = self._clean_reply_text(self._drop_question_sentences(reply.strip()))
+        reply = self._clean_reply_text(self._tame_questions(reply.strip()))
+        # 正文里 @ 别人会给第三方刷通知(模型屡教不改),降级成纯名字
+        reply = self._strip_inner_mentions(
+            reply, [from_user, topic.get("op_name")]
+            + [p.get("author") for p in (topic.get("posts") or [])])
         # 注入兜底:回复中出现源材料里不存在的域名 → 删该行;泄漏/过短 → 重试
-        # ⚠ 源材料只含帖子内容,**不含对方的 @ 消息** —— 注入文本里若带垃圾域名,
-        #   混进白名单就会让清除逻辑失效(实测踩过)
+        # ⚠ 白名单必须**排除 @ 你的那个人写的楼层** —— 注入文本里的垃圾域名混进
+        #   白名单就会让清除逻辑整个失效。posts 是全部楼层,天然包含他那一楼,
+        #   所以这里按作者剔除(他可能把载荷放在同帖的另一楼,不只是 rid 那层)
         source = ((topic.get("content") or "") + " "
-                  + " ".join((p.get("content") or "") for p in (topic.get("posts") or [])))
+                  + " ".join((p.get("content") or "")
+                             for p in (topic.get("posts") or [])
+                             if (p.get("author") or "") != from_user
+                             and p.get("pid") != str(rid)))
         reply, removed = self._strip_unknown_links(reply, source)
         if removed:
             log("  已移除回复中来源不明的链接内容(疑似注入)", "WARN")
-        if not reply or len(reply) < 30 or self._reply_poisoned(reply):
+        # 长度下限只用来挡空回复:提示词要的就是简短回应,
+        # 卡到 30 字会把「这个我踩过,重启就行」这种正常短回复当注入丢掉
+        if not reply or len(reply) < 10 or self._reply_poisoned(reply):
             # 注入兜底:疑似泄漏/异常内容不发布。不消费通知,重试 3 次才放弃
             n_fail = self.notif_llm_fail.get(rid, 0) + 1
             self.notif_llm_fail[rid] = n_fail
@@ -619,7 +719,8 @@ class Bot:
                 if not self.running:
                     return False
                 time.sleep(1)
-            ok, msg = self.site.send_dm(n.get("from_uid") or 0, reply[:490])
+            ok, msg = self.site.send_dm(n.get("from_uid") or 0,
+                                        self._truncate(reply, 480))
             if not ok and ("未找到私信表单" in (msg or "") or "私信页打开失败" in (msg or "")):
                 # 会话失效类症状:不消费,强制重登,下轮重试,连续 3 次才放弃
                 n_fail = self.notif_submit_fail.get(rid, 0) + 1
@@ -643,13 +744,12 @@ class Bot:
                 log("  私信发送失败 #%d: %s(不重试,防止重复发送)" % (tid, msg), "WARN")
             return True
 
-        # ---- 公开渠道:定位对方楼层,盖楼回复(楼层号是对方那条回复所在的楼) ----
-        floor, their_text_full = self.site.locate_floor(tid, rid)
+        # ---- 公开渠道:盖楼回复(楼层号 = 对方那条回复所在的楼,生成前已定位) ----
         if floor is None:
             log("  通知接话: 未能定位 %s 的回复楼层(审核隐藏/已删除),改用纯 @ 提及"
                 % from_user, "WARN")
         mention = "@%s" % from_user + (" #%d" % floor if floor else "")
-        text = "%s %s" % (mention, reply)
+        text = "%s %s" % (mention, self._truncate(reply, 600))
         log("  ---- 通知接话 #%d(%s 在 %s 提到你) ----\n%s\n  ----------------"
             % (tid, from_user, ("#%d 楼" % floor) if floor else "主题", text))
 
@@ -685,7 +785,7 @@ class Bot:
                               "ok" if ok else "fail:%s" % msg)
         if ok:
             self.store.incr_today()
-            log("  已回复 %s 在 #%d: %s" % (from_user, tid, msg))
+            log("  已回复 %s(帖子 #%d): %s" % (from_user, tid, msg))
         else:
             log("  通知接话提交失败 #%d: %s(不重试,防止重复接话)" % (tid, msg), "WARN")
         return True
@@ -768,6 +868,10 @@ class Bot:
             log("  LLM 失败: %s" % err, "ERROR")
             return
         text = re.sub(r"\s+\n", "\n", text).strip()
+        text = self._tame_questions(self._clean_reply_text(text))
+        text = self._strip_inner_mentions(
+            text, [topic.get("op_name")]
+            + [p.get("author") for p in (topic.get("posts") or [])])
         # 注入兜底:回复中来源不明的域名整行移除(源材料 = 帖子 + 搜索结果)
         source = ((topic.get("content") or "") + " "
                   + " ".join((p.get("content") or "") for p in (topic.get("posts") or []))
@@ -779,7 +883,7 @@ class Bot:
             # 注入兜底:疑似提示词泄漏/垃圾内容,丢弃不发布(帖子保持已见,不重试)
             log("  回复疑似提示词泄漏或垃圾内容,已丢弃不发布: #%d" % tid, "WARN")
             return
-        text = text[:600]                     # 公开回复硬上限,防被注入刷长文
+        text = self._truncate(text, 600)     # 公开回复硬上限,防被注入刷长文
         log("  ---- 拟回复 ----\n%s\n  ----------------" % text)
 
         if self.dry:
