@@ -172,4 +172,8 @@ def build_opener(proxy="", ua=DEFAULT_UA):
     """给不走 Cookie 的场景(如 LLM 调用)用的裸 opener。"""
     handlers = [urllib.request.ProxyHandler(
         {"http": proxy, "https": proxy} if proxy else {})]
-    return urllib.request.build_opener(*handlers)
+    opener = urllib.request.build_opener(*handlers)
+    # 中转站常挂 Cloudflare:默认 UA 是 Python-urllib/x.y,会被 1010 拦掉。
+    # 把 UA 设到 opener 层,即使调用方 Request 漏设 UA 也能兜底。
+    opener.addheaders = [("User-Agent", ua or DEFAULT_UA)]
+    return opener

@@ -7,6 +7,7 @@
 """
 
 import gzip
+import ipaddress
 import json
 import re
 import time
@@ -16,6 +17,44 @@ import urllib.request
 from .http import build_opener
 from .log import log
 from .paths import DEFAULT_UA
+
+
+# 本机/局域网目标:代理节点根本不可达(节点上没有你的回环地址,
+# 也摸不到你的内网),必须直连。覆盖回环、RFC1918 私网、link-local,
+# 以及 .local/.lan/.internal 这类内网主机名。
+_LOCAL_HOSTNAMES = ("localhost",)
+_LOCAL_SUFFIXES = (".local", ".lan", ".internal")
+_LOCAL_BYPASS_LOGGED = set()
+
+
+def _is_local_target(base):
+    """base_url 是否指向本机/局域网地址(本机部署的反代/模型服务、
+    内网其他机器上的服务等)。
+
+    这类地址走代理必失联:请求被转给代理节点,而节点上既没有你的
+    回环地址、也路由不到你的内网,连接直接挂到超时(实测:同一请求
+    直连约 1 秒返回,经代理则直到超时也无响应)。
+    """
+    b = (base or "").strip().lower()
+    if "://" not in b:
+        return False
+    host = b.split("://", 1)[1].split("/", 1)[0]      # 去路径
+    if "@" in host:                                    # 去 userinfo
+        host = host.rsplit("@", 1)[1]
+    if host.startswith("["):                           # IPv6 [::1]:端口
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:                         # 主机:端口
+        host = host.rsplit(":", 1)[0]
+    if not host:
+        return False
+    if host in _LOCAL_HOSTNAMES or host.endswith(_LOCAL_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False                                   # 域名:无法静态判断,按外部处理
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_unspecified)
 
 
 def _chat_once(cfg, provider, system_prompt, user_prompt, opener, strict_tail=True):
@@ -82,15 +121,27 @@ def call_llm(cfg, system_prompt, user_prompt, strict_tail=True):
                       "(providers / base_url+api_key+model 均为空)")
 
     proxy = cfg.get("llm_proxy") or cfg.get("proxy") or ""
-    opener = build_opener(proxy, ua=cfg.get("user_agent") or DEFAULT_UA)
+    ua = cfg.get("user_agent") or DEFAULT_UA
+    opener = build_opener(proxy, ua=ua)
+    # 本机/局域网 provider 专用直连 opener,见 _is_local_target 注释
+    direct_opener = build_opener("", ua=ua)
 
     retry = max(1, int(llm.get("max_retry", 2) or 1))
     errs = []
     for p in providers:
         name = p.get("name") or p.get("model")
+        base = (p.get("base_url") or "").rstrip("/")
+        if _is_local_target(base):
+            if name not in _LOCAL_BYPASS_LOGGED:
+                _LOCAL_BYPASS_LOGGED.add(name)
+                log("  「%s」指向本机/局域网(%s),强制直连、不走代理"
+                    % (name, base), "INFO")
+            p_opener = direct_opener
+        else:
+            p_opener = opener
         for attempt in range(1, retry + 1):
             try:
-                return _chat_once(cfg, p, system_prompt, user_prompt, opener,
+                return _chat_once(cfg, p, system_prompt, user_prompt, p_opener,
                                   strict_tail=strict_tail), None
             except urllib.error.HTTPError as e:
                 detail = ""
