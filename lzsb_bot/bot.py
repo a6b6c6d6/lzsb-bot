@@ -31,6 +31,21 @@ from .search import search as web_search
 from .search import format_block, build_query, describe_mode
 
 
+# 站点 2026-10-27 起打赏只接受固定档位(6/10/33/66/88,0=只点赞),
+# 自定义金额会被拒:{"ok":0,"message":"请选择固定打赏金额"}。
+# 只打赏模式的评分(0-20)→ 档位映射:低分给最小档,高分逐级升高。
+# 想省钱/加码直接改这里(阈值降序,金额必须是站点档位)。
+DONATE_SCORE_TIERS = ((19, 88), (16, 66), (11, 33), (6, 10), (1, 6))
+
+
+def _amount_for_score(score):
+    """AI 评分 → 站点固定档位金额;0 分及以下返回 0(不打赏)。"""
+    for threshold, amount in DONATE_SCORE_TIERS:
+        if score >= threshold:
+            return amount
+    return 0
+
+
 class Bot:
     def __init__(self, cfg, dry_run=None, once=False, donate_only=False):
         self.cfg = cfg
@@ -158,9 +173,11 @@ class Bot:
         """
         if not self.cfg.get("donate_enabled", True):
             return
-        amount = int(self.cfg.get("donate_amount", 1) or 0)
+        amount = int(self.cfg.get("donate_amount", 6) or 0)
         if amount <= 0:
             return
+        # 站点只收固定档位;先归一,日志里报的金额才和实际一致
+        amount = self.site.normalize_donate_amount(amount)
         # 不给自己打赏(理论上 bot 不会回自己的帖,兜个底)
         if (topic.get("op_name") or "") == (self.cfg.get("bot_username") or ""):
             return
@@ -301,14 +318,18 @@ class Bot:
                 % (tid, (topic.get("title") or "")[:36], score, reason))
 
             amount = 0
+            tier = _amount_for_score(score)
             if score <= 0:
                 log("  AI 判定无价值(0 分),不打赏")
             elif score < min_score:
                 log("  评分低于阈值 %d,不打赏" % min_score)
+            elif tier > budget:
+                log("  档位 %d 超出剩余预算 %d,跳过(可调低 donate_reserve 或收紧档位)"
+                    % (tier, budget), "WARN")
             else:
-                amount = min(score, budget)
+                amount = tier
                 if self.dry:
-                    log("  [DRY-RUN] 拟打赏 #%d %d 积分(未提交)" % (tid, amount))
+                    log("  [DRY-RUN] 拟打赏 #%d %d 积分(档位,未提交)" % (tid, amount))
                     budget -= amount
                     done += 1
                 else:
@@ -939,8 +960,13 @@ class Bot:
         else:
             log("  联网搜索  : 关闭")
         if cfg.get("donate_enabled", True):
-            log("  自动打赏  : 开启,回帖成功后给楼主打赏 %d 积分"
-                % int(cfg.get("donate_amount", 1) or 0))
+            amt = self.site.normalize_donate_amount(
+                int(cfg.get("donate_amount", 6) or 0))
+            if amt > 0:
+                log("  自动打赏  : 开启,回帖成功后给楼主打赏 %d 积分(站点固定档位)"
+                    % amt)
+            else:
+                log("  自动打赏  : 关闭(金额为 0)")
         else:
             log("  自动打赏  : 关闭")
         if cfg.get("notify_reply_enabled", True):
@@ -961,6 +987,8 @@ class Bot:
                 % (int(cfg.get("donate_reserve", 200) or 0),
                    cfg.get("donate_max_per_tick", 10),
                    cfg.get("donate_min_score", 1)))
+            log("  评分档位  : %s" % "  ".join(
+                "≥%d分→%d" % (t, a) for t, a in DONATE_SCORE_TIERS))
         log("=" * 60)
 
     def run(self):

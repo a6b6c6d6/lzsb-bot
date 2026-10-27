@@ -586,16 +586,48 @@ class LsbSite:
     # 打赏(点赞 + 积分)
     # ==================================================================
 
+    # 站点 2026-10-27 起打赏金额改为固定档位(表单 data-amount 按钮),
+    # 自定义金额被服务端拒绝:{"ok":0,"message":"请选择固定打赏金额，刷新页面后重试"}。
+    # 这里是不依赖页面解析的兜底档位;表单里能解析到档位时以表单为准。
+    DONATE_PRESETS = (6, 10, 33, 66, 88)
+
+    @staticmethod
+    def normalize_donate_amount(amount, presets=None):
+        """任意金额 → 站点接受的固定档位(向上取最近档);0/负数 = 只点赞。
+
+        向上取而不是向下:少给会被服务端拒,多给一点是能成功的最近解。
+        """
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return 0
+        if amount <= 0:
+            return 0
+        presets = tuple(sorted(presets or LsbSite.DONATE_PRESETS))
+        if amount in presets:
+            return amount
+        for p in presets:
+            if p >= amount:
+                return p
+        return presets[-1]
+
+    def parse_donate_presets(self, html):
+        """从打赏表单里取固定金额档位(data-amount="N");取不到用默认档位。"""
+        vals = sorted({int(x) for x in re.findall(r'data-amount="(\d+)"', html or "")})
+        return tuple(vals) or self.DONATE_PRESETS
+
     def parse_donate_form(self, html):
         """从打赏弹层页解析 POST /donate 所需的全部字段。
 
-        表单实测结构(2026-09-12):
+        表单实测结构(2026-10-27 新版,金额改为固定档位):
             <form method="post" action="/donate" data-donate-form data-no-ajax="1">
               <input type="hidden" name="_csrf" value="...">
               <input type="hidden" name="topic_id" value="...">
               <input type="hidden" name="request_key" value="...">
-              <input type="number" name="amount" min="1" max="99"
-                     placeholder="不填写则只点赞">
+              <button type="button" data-amount="6">6</button> …(6/10/33/66/88)
+              <input type="hidden" name="amount" value="0" data-donate-amount>
+        旧版(2026-09-12)是 <input type="number" name="amount" min="1" max="99">,
+        允许自定义金额;新版 amount 为隐藏字段,只接受固定档位,0 = 只点赞不顶帖。
         request_key 每次打开页面都变,必须现取。
         """
         m = re.search(r'<form method="post" action="/donate"[^>]*>(.*?)</form>',
@@ -618,7 +650,8 @@ class LsbSite:
 
         流程:GET /donate?topic_id=N 拿弹层表单(含一次性 request_key)
              → POST /donate (multipart,与浏览器一致)
-        返回 (ok, message)。余额不足等业务拒绝不重试。
+        amount 会自动归一到站点的固定档位(2026-10-27 起只收 6/10/33/66/88,
+        0 = 只点赞);返回 (ok, message)。余额不足等业务拒绝不重试。
         """
         url = "%s/donate?topic_id=%d" % (self.base, tid)
         code, html, _ = self.http.get(url)
@@ -628,6 +661,13 @@ class LsbSite:
         form = self.parse_donate_form(html)
         if not form:
             return False, "打赏页里没有找到表单(可能已登录失效/已打赏过/不可打赏)"
+
+        presets = self.parse_donate_presets(html)
+        raw_amount = amount
+        amount = self.normalize_donate_amount(amount, presets)
+        if amount != raw_amount:
+            log("  打赏金额 %s 不在站点固定档位 %s,按 %d 提交"
+                % (raw_amount, "/".join(str(p) for p in presets), amount), "WARN")
 
         fields = [("_csrf", form["_csrf"]),
                   ("topic_id", form["topic_id"] or str(tid)),
